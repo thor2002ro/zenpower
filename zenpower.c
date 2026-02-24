@@ -48,15 +48,26 @@
  * a sentinel or implausible value.
  */
 
-#include <asm/amd_nb.h>
 #include <linux/hwmon.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/version.h>
+
+/*
+ * Linux 6.16 reorganised the AMD northbridge header from asm/amd_nb.h into
+ * asm/amd/nb.h.  Guard both paths so the driver builds on kernels before and
+ * after that rename.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#include <asm/amd/nb.h>
+#else
+#include <asm/amd_nb.h>
+#endif
 
 MODULE_DESCRIPTION("AMD ZEN family CPU Sensors Driver");
 MODULE_AUTHOR("thor2002ro");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.3.0");
+MODULE_VERSION("0.4.0");
 
 /* ---- Module parameters -------------------------------------------------- */
 
@@ -194,7 +205,13 @@ MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
 #define ZEN_SMU_PKG_PPT_ADDR 0x000398BC  /* Package power limit (PPT) */
 #define ZEN_SMU_CORE_TDC_ADDR 0x000398C0 /* Sustained current cap (TDC) */
 #define ZEN_SMU_CORE_EDC_ADDR 0x000398C4 /* Peak current cap (EDC) */
-#define ZEN_SMU_SOC_PPT_ADDR 0x0005994C  /* SoC subsystem power */
+/*
+ * ZEN_SMU_SOC_PPT_ADDR: SoC subsystem power register.  Present in debug dump
+ * for investigative use but not exposed as a hwmon channel because its unit
+ * and layout differ significantly across firmware versions and are not reliably
+ * community-verified.  Do not use for power calculations without validation.
+ */
+#define ZEN_SMU_SOC_PPT_ADDR 0x0005994C
 
 #define SMU_REG_SENTINEL_FF 0xFFFFFFFF
 #define SMU_REG_SENTINEL_00 0x00000000
@@ -291,7 +308,24 @@ static const struct tctl_offset tctl_offset_table[] = {
 };
 
 static DEFINE_MUTEX(nb_smu_ind_mutex);
+/*
+ * multicpu: set when more than one physical CPU package is detected.
+ * Written once at probe time; READ_ONCE/WRITE_ONCE enforce ordering so that
+ * concurrent readers in read_labels() see a consistent value without a lock.
+ */
 static bool multicpu;
+
+/*
+ * amd_pci_dev_to_node_id() was removed from the public kernel API in 6.14
+ * (commit c3e2e8f5).  Re-implement it here for kernels that no longer export
+ * it; the logic is identical to the removed helper -- PCI slot minus the
+ * slot number of node 0.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+static u16 amd_pci_dev_to_node_id(struct pci_dev *pdev) {
+  return PCI_SLOT(pdev->devfn) - AMD_NODE0_PCI_SLOT;
+}
+#endif
 
 /* ---- SMN access backends ------------------------------------------------- */
 
@@ -324,8 +358,13 @@ static void nb_index_read(struct pci_dev *pdev, u16 node_id, u32 address,
  */
 static u32 svi2_to_vcc(u32 p) {
   u32 vdd = (p >> 16) & 0xff;
+  s32 mv = 1550 - (s32)((625u * vdd) / 100u);
 
-  return 1550 - ((625 * vdd) / 100);
+  /*
+   * VDDcor >= 249 makes the formula negative (rail shutdown / error state).
+   * Clamp to 0 rather than silently wrapping to ~4 GV on the u32 path.
+   */
+  return (mv < 0) ? 0u : (u32)mv;
 }
 
 static u32 svi2_core_ma(u32 p, enum zen_generation gen) {
@@ -346,7 +385,13 @@ static u32 svi2_soc_ma(u32 p, enum zen_generation gen) {
  */
 /*
  * Voltage bits[15:8] = VDDcor
- *   V (mV) = 245 - 1.065 * VDDcor
+ *   V (mV) = 1550 - 6.25 * VDDcor
+ *
+ * The numeric formula is identical to SVI2; only the bit position of VDDcor
+ * changes (bits[23:16] on SVI2, bits[15:8] on SVI3).  Community RE on Raphael
+ * and Granite Ridge confirms this; the previously-used formula
+ * "245 - 1.065 * VDDcor" is wrong -- it yields sub-200 mV for all realistic
+ * VID values and would break the auto-detect plausibility check.
  *
  * Current bits[6:0] = IDDcor (7-bit)
  *   Core I (mA) = 1000 * IDDcor / 4
@@ -356,10 +401,10 @@ static u32 svi2_soc_ma(u32 p, enum zen_generation gen) {
  * community coefficients.  Use force_svi2 if readings look wrong.
  */
 static u32 svi3_to_vcc(u32 p) {
-  u32 vdd = (p >> 8) & 0xff;
-  u32 uv = 245000 - 1065 * vdd; /* integer microvolt arithmetic */
+  u32 vdd = (p >> 8) & 0xff; /* bits[15:8] -- VDDcor field for SVI3 */
+  s32 mv = 1550 - (s32)((625u * vdd) / 100u);
 
-  return uv / 1000;
+  return (mv < 0) ? 0u : (u32)mv;
 }
 
 static u32 svi3_core_ma(u32 p) { return (1000 * (p & 0x7f)) / 4; }
@@ -404,17 +449,22 @@ static long safe_power_uw(u32 ma, u32 mv) {
  * soft-float ABI issues on kernel builds without FPU.
  *
  * float layout: [31] sign | [30:23] biased exponent | [22:0] mantissa
+ *
+ * exp upper bound of 23: 2^23 W = ~8 MW, safely above any realistic CPU power.
+ * This also allows the left-shift (exp >= 23) path to be reachable; the
+ * previous bound of 20 made that branch dead code.
  */
 static long smu_float_to_uw(u32 raw) {
   u32 sign = (raw >> 31) & 1;
   s32 exp = (s32)((raw >> 23) & 0xff) - 127;
   u32 mantissa = (raw & 0x7fffff) | 0x800000; /* implicit leading 1 */
-  u64 watts_sc; /* watts * 2^23 represented as integer */
+  u64 watts_sc; /* mantissa scaled by 2^(exp-23), i.e. watts * 2^23 */
 
-  /* Reject: negative, zero, infinity/NaN (exp=0xff), out-of-range exponents */
+  /* Reject: negative, zero, infinity/NaN (biased exp = 0xff) */
   if (sign || raw == 0 || ((raw >> 23) & 0xff) == 0xff)
     return 0;
-  if (exp < -10 || exp > 20)
+  /* Reject sub-milliwatt noise and values above ~8 MW */
+  if (exp < -10 || exp > 23)
     return 0;
 
   if (exp >= 23)
@@ -422,7 +472,7 @@ static long smu_float_to_uw(u32 raw) {
   else
     watts_sc = (u64)mantissa >> (u32)(23 - exp);
 
-  /* watts -> µW: * 1,000,000 */
+  /* watts -> µW: multiply by 1,000,000.  watts_sc <= 2^23 so no overflow. */
   return (long)min_t(u64, watts_sc * 1000000ULL, (u64)LONG_MAX);
 }
 
@@ -461,6 +511,11 @@ static enum svi_version detect_svi_version(struct zenpower_data *data,
                                            enum svi_version presumed) {
   u32 plane, mv;
 
+  if (force_svi2 && force_svi3) {
+    pr_warn("zenpower: force_svi2 and force_svi3 are both set -- "
+            "force_svi2 takes precedence\n");
+    return SVI_VER_2;
+  }
   if (force_svi2)
     return SVI_VER_2;
   if (force_svi3)
@@ -522,11 +577,16 @@ static unsigned int get_ctl_temp(struct zenpower_data *data) {
   return temp;
 }
 
-static unsigned int get_ccd_temp(struct zenpower_data *data, u32 addr) {
+static int get_ccd_temp(struct zenpower_data *data, u32 addr) {
   u32 regval;
 
   data->read_amdsmn_addr(data->pdev, data->node_id, addr, &regval);
-  return (regval & ZEN_CCD_TEMP_VALID_MASK) * 125 - 305000;
+  /*
+   * Signed arithmetic: (raw * 125) - 305000 millidegrees C.
+   * Return type must be int so that sub-ambient readings (raw < 2440)
+   * are negative rather than wrapping to ~4 GB on unsigned subtraction.
+   */
+  return (int)((regval & ZEN_CCD_TEMP_VALID_MASK) * 125u) - 305000;
 }
 
 /* ---- hwmon visibility ---------------------------------------------------- */
@@ -594,7 +654,17 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
   /* Temperatures */
   case hwmon_temp:
     if (attr == hwmon_temp_max) {
-      *val = 95000;
+      /*
+       * Tdie max = Tctl max - Tctl_offset.
+       * AMD spec says Tctl max = 95°C for all Zen desktop/TR.
+       * Tdie channel (ch0) must subtract the chip-specific offset.
+       * Tctl channel (ch1) has no offset, so its max is always 95°C.
+       * CCD channels have no published max; skip (handled by default).
+       */
+      if (channel == 0)
+        *val = 95000 - data->temp_offset;
+      else
+        *val = 95000;
       return 0;
     }
     if (attr != hwmon_temp_input)
@@ -797,7 +867,7 @@ static int zenpower_read_labels(struct device *dev,
   struct zenpower_data *data;
   u8 i = 0;
 
-  if (multicpu) {
+  if (READ_ONCE(multicpu)) {
     data = dev_get_drvdata(dev);
     if (data->cpu_id <= 1)
       i = data->cpu_id + 1;
@@ -836,32 +906,39 @@ static const u32 debug_addrs[] = {
 static ssize_t debug_data_show(struct device *dev,
                                struct device_attribute *attr, char *buf) {
   struct zenpower_data *data = dev_get_drvdata(dev);
-  int i, len = 0;
+  ssize_t len = 0;
+  int i;
   u32 raw;
 
-  len += sprintf(buf + len, "KERN_SUP:   %d\n", data->kernel_smn_support);
-  len += sprintf(buf + len, "NODE %u; CPU %u; N/CPU: %u\n", data->node_id,
-                 data->cpu_id, data->nodes_per_cpu);
-  len += sprintf(buf + len, "ZEN_GEN:    %d\n", (int)data->zen_gen);
-  len += sprintf(buf + len, "SVI_VER:    %d\n",
-                 (data->svi_ver == SVI_VER_3) ? 3 : 2);
-  len += sprintf(buf + len, "IS_APU:     %d\n", data->is_apu);
-  len += sprintf(buf + len, "AMPS_VIS:   %d\n", data->amps_visible);
-  len += sprintf(buf + len, "PPT_VIS:    %d\n", data->ppt_visible);
-  len += sprintf(buf + len, "TDC_VIS:    %d\n", data->tdc_visible);
-  len += sprintf(buf + len, "EDC_VIS:    %d\n", data->edc_visible);
-  len += sprintf(buf + len, "FLOAT_PWR:  %d\n", data->smu_float_power);
-  len += sprintf(buf + len, "SVI_CORE:   %08x\n", data->svi_core_addr);
-  len += sprintf(buf + len, "SVI_SOC:    %08x\n", data->svi_soc_addr);
-  len += sprintf(buf + len, "SMU_PPT:    %08x\n", data->smu_ppt_addr);
-  len += sprintf(buf + len, "SMU_TDC:    %08x\n", data->smu_tdc_addr);
-  len += sprintf(buf + len, "SMU_EDC:    %08x\n", data->smu_edc_addr);
-  len += sprintf(buf + len, "---\n");
+#define DBGPR(fmt, ...)                                                        \
+  len += scnprintf(buf + len, PAGE_SIZE - len, fmt, ##__VA_ARGS__)
+
+  DBGPR("KERN_SUP:   %d\n", data->kernel_smn_support);
+  DBGPR("NODE %u; CPU %u; N/CPU: %u\n", data->node_id, data->cpu_id,
+        data->nodes_per_cpu);
+  DBGPR("ZEN_GEN:    %d\n", (int)data->zen_gen);
+  DBGPR("SVI_VER:    %d\n", (data->svi_ver == SVI_VER_3) ? 3 : 2);
+  DBGPR("IS_APU:     %d\n", data->is_apu);
+  DBGPR("AMPS_VIS:   %d\n", data->amps_visible);
+  DBGPR("PPT_VIS:    %d\n", data->ppt_visible);
+  DBGPR("TDC_VIS:    %d\n", data->tdc_visible);
+  DBGPR("EDC_VIS:    %d\n", data->edc_visible);
+  DBGPR("FLOAT_PWR:  %d\n", data->smu_float_power);
+  DBGPR("SVI_CORE:   %08x\n", data->svi_core_addr);
+  DBGPR("SVI_SOC:    %08x\n", data->svi_soc_addr);
+  DBGPR("SMU_PPT:    %08x\n", data->smu_ppt_addr);
+  DBGPR("SMU_TDC:    %08x\n", data->smu_tdc_addr);
+  DBGPR("SMU_EDC:    %08x\n", data->smu_edc_addr);
+  DBGPR("---\n");
 
   for (i = 0; i < ARRAY_SIZE(debug_addrs); i++) {
+    if (len >= PAGE_SIZE - 20)
+      break; /* stop before overrun */
     data->read_amdsmn_addr(data->pdev, data->node_id, debug_addrs[i], &raw);
-    len += sprintf(buf + len, "%08x = %08x\n", debug_addrs[i], raw);
+    DBGPR("%08x = %08x\n", debug_addrs[i], raw);
   }
+
+#undef DBGPR
   return len;
 }
 
@@ -966,7 +1043,7 @@ static int zenpower_probe(struct pci_dev *pdev,
   data->cpu_id = data->node_id / data->nodes_per_cpu;
 
   if (data->cpu_id > 0)
-    multicpu = true;
+    WRITE_ONCE(multicpu, true);
 
   /* Default SMU addresses -- overridden per generation where known */
   data->smu_ppt_addr = ZEN_SMU_PKG_PPT_ADDR;
