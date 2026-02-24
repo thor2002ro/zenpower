@@ -1,4 +1,11 @@
 /*
+ * Zenpower - AMD Zen family CPU telemetry driver
+ *
+ * Copyright (c) 2018-2020 Ondrej Čerman
+ * Copyright (c) 2024-2026 thor2002ro
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
  * Based on k10temp by Clemens Ladisch.
  *
  * Docs:
@@ -6,27 +13,39 @@
  *   https://developer.amd.com/wp-content/resources/56255_3_03.PDF
  *
  * Sources:
- *   - Temperature monitoring: k10temp
- *   - SVI2 address and voltage formula: LibreHardwareMonitor
- *   - SVI3 address and formula: community reverse engineering / LHM
- *   - Current formulas, CCD temp addresses: experimental
+ *   - Temperature monitoring    : k10temp
+ *   - SVI2 decode               : LibreHardwareMonitor
+ *   - SVI3 decode               : community RE (Raphael / Granite Ridge
+ * verified)
+ *   - CCD addresses / SMU regs  : experimental + RyzenAdj / zenergy
  *
  * Generation support matrix:
- *   Zen  (17h 0x01, 0x08)         - SVI2 Ryzen/TR/EPYC
- *   Zen  APU (17h 0x11, 0x18)     - SVI2 Raven Ridge / Picasso
- *   Zen2 (17h 0x31)               - SVI2 Threadripper/EPYC (Castle Peak / Rome)
- *   Zen2 APU (17h 0x60, 0x68)     - SVI2 Renoir / Lucienne
- *   Zen2 APU (17h 0x90)           - SVI2 Van Gogh (Steam Deck)
- *   Zen2 (17h 0x71)               - SVI2 Ryzen 3000 (Matisse)
- *   Zen3 SP3/TR (19h 0x00-0x01)   - SVI2 Milan / Chagall
- *   Zen3 APU (19h 0x50)           - SVI2 Cezanne / Barcelo
- *   Zen3 (19h 0x21)               - SVI2 Ryzen 5000 (Vermeer)
- *   Zen3+ APU (19h 0x40, 0x44)    - SVI2 Rembrandt / Rembrandt-R
- *   Zen4 SP3 (19h 0x10-0x11)      - SVI3 Genoa (server)
- *   Zen4 (19h 0x61)               - SVI3 Raphael (Ryzen 7000 desktop)
- *   Zen4 APU (19h 0x70-0x78)      - SVI3 Phoenix / Hawk Point
- *   Zen5 APU (1Ah 0x20-0x24)      - SVI3 Strix Point / Strix Halo
- *   Zen5 (1Ah 0x44)               - SVI3 Granite Ridge (Ryzen 9000 desktop)
+ *   Zen  (17h 0x01,0x08)        SVI2  Ryzen 1000/2000, Summit/Pinnacle Ridge
+ *   Zen  APU (17h 0x11,0x18)    SVI2  Raven Ridge / Picasso
+ *   Zen2 (17h 0x31)             SVI2  Castle Peak TR / Rome EPYC
+ *   Zen2 APU (17h 0x60,0x68)    SVI2  Renoir / Lucienne
+ *   Zen2 APU (17h 0x90)         SVI2  Van Gogh (Steam Deck)
+ *   Zen2 (17h 0x71)             SVI2  Matisse Ryzen 3000
+ *   Zen3 SP3 (19h 0x00-0x01)    SVI2  Milan EPYC / Chagall TR
+ *   Zen3 (19h 0x21)             SVI2  Vermeer Ryzen 5000
+ *   Zen3 APU (19h 0x50)         SVI2  Cezanne / Barcelo
+ *   Zen3+ APU (19h 0x40,0x44)   SVI2  Rembrandt / Rembrandt-R
+ *   Zen4 SP3 (19h 0x10-0x11)    SVI3  Genoa EPYC
+ *   Zen4 (19h 0x61)             SVI3  Raphael Ryzen 7000
+ *   Zen4 APU (19h 0x70-0x78)    SVI3  Phoenix / Hawk Point
+ *   Zen5 APU (1Ah 0x20-0x24)    SVI3  Strix Point / Strix Halo
+ *   Zen5 (1Ah 0x44)             SVI3  Granite Ridge Ryzen 9000
+ *
+ * Power channels exposed:
+ *   power1  Core rail power  (SVI VRM telemetry, uW)
+ *   power2  SoC  rail power  (SVI VRM telemetry, uW)
+ *   power3  Package PPT      (SMU silicon limit, uW, when readable)
+ *   power4  TDC x Vcore      (sustained current proxy, uW, informational)
+ *   power5  EDC x Vcore      (peak current proxy, uW, informational)
+ *
+ * NOTE: power3-5 use SMU scratch registers whose layout is community-
+ * derived.  They hide themselves at probe time if the register returns
+ * a sentinel or implausible value.
  */
 
 #include <asm/amd_nb.h>
@@ -35,15 +54,26 @@
 #include <linux/pci.h>
 
 MODULE_DESCRIPTION("AMD ZEN family CPU Sensors Driver");
-MODULE_AUTHOR("Ondrej Čerman");
+MODULE_AUTHOR("thor2002ro");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.2.0");
+MODULE_VERSION("0.3.0");
+
+/* ---- Module parameters -------------------------------------------------- */
 
 static bool zen1_calc;
-module_param(zen1_calc, bool, 0);
-MODULE_PARM_DESC(zen1_calc, "Set to 1 to force ZEN1 SVI2 current calculation");
+module_param(zen1_calc, bool, 0444);
+MODULE_PARM_DESC(zen1_calc,
+                 "Force Zen1 SVI2 current coefficients (default: auto)");
 
-/* ── PCI Device IDs ─────────────────────────────────────────────────────── */
+static bool force_svi2;
+module_param(force_svi2, bool, 0444);
+MODULE_PARM_DESC(force_svi2, "Force SVI2 decode path on all chips");
+
+static bool force_svi3;
+module_param(force_svi3, bool, 0444);
+MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
+
+/* ---- PCI Device IDs ----------------------------------------------------- */
 
 /* Family 17h – Zen / Zen+ / Zen2 */
 #ifndef PCI_DEVICE_ID_AMD_17H_DF_F3
@@ -107,7 +137,7 @@ MODULE_PARM_DESC(zen1_calc, "Set to 1 to force ZEN1 SVI2 current calculation");
           */
 #endif
 
-/* ── SMN Register Addresses ─────────────────────────────────────────────── */
+/* ---- SMN Register Addresses --------------------------------------------- */
 
 #define F17H_M01H_REPORTED_TEMP_CTRL 0x00059800
 #define F17H_M01H_SVI 0x0005A000
@@ -150,16 +180,34 @@ MODULE_PARM_DESC(zen1_calc, "Set to 1 to force ZEN1 SVI2 current calculation");
 #define F1AH_M44H_SVI3_TEL_PLANE1 (F17H_M01H_SVI + 0x0C)
 
 /* CCD temperature registers */
-#define F17H_M70H_CCD_TEMP(x) (0x00059954 + ((x) * 4)) /* Zen2 / Zen3       */
-#define F19H_CCD_TEMP(x) (0x00059954 + ((x) * 4))      /* Zen3 / Zen4 same  */
+#define ZEN_CCD_TEMP(x) (0x00059954 + ((x) * 4))
+#define ZEN_CCD_TEMP_VALID_MASK 0xfff
 
-/* Package power reporting via SMU scratch (not universally supported) */
-#define ZEN_SMU_CORE_PWR_ADDR 0x000598BC
-#define ZEN_SMU_SOC_PWR_ADDR 0x0005994C
+/*
+ * SMU scratch / metrics registers (community-derived, best-effort).
+ *
+ * Format on Zen2/3: 32-bit integer, units = milliwatts.
+ * Format on Zen4/5: 32-bit IEEE-754 single-precision float, units = watts.
+ *
+ * All values returned to hwmon in microwatts.
+ */
+#define ZEN_SMU_PKG_PPT_ADDR 0x000398BC  /* Package power limit (PPT) */
+#define ZEN_SMU_CORE_TDC_ADDR 0x000398C0 /* Sustained current cap (TDC) */
+#define ZEN_SMU_CORE_EDC_ADDR 0x000398C4 /* Peak current cap (EDC) */
+#define ZEN_SMU_SOC_PPT_ADDR 0x0005994C  /* SoC subsystem power */
+
+#define SMU_REG_SENTINEL_FF 0xFFFFFFFF
+#define SMU_REG_SENTINEL_00 0x00000000
+
+/*
+ * Plausibility window for SVI voltage auto-detection.
+ * Any decoded voltage outside this range (mV) means the register layout
+ * is wrong and the other protocol version should be tried.
+ */
+#define SVI_VOLTAGE_MIN_MV 600
+#define SVI_VOLTAGE_MAX_MV 1600
 
 #define F17H_TEMP_ADJUST_MASK 0x80000
-
-/* Maximum CCDs per die for each supported generation */
 #define MAX_CCD 8
 
 #ifndef HWMON_CHANNEL_INFO
@@ -168,36 +216,60 @@ MODULE_PARM_DESC(zen1_calc, "Set to 1 to force ZEN1 SVI2 current calculation");
                                 .config = (u32[]){__VA_ARGS__, 0}})
 #endif
 
-/* ── Zen generation enum ─────────────────────────────────────────────────── */
+/* ---- Zen generation enum ------------------------------------------------- */
 
 enum zen_generation {
-  ZEN_GEN_1, /* Zen, Zen+                  */
-  ZEN_GEN_2, /* Zen2                       */
-  ZEN_GEN_3, /* Zen3, Zen3+                */
-  ZEN_GEN_4, /* Zen4 (SVI3)                */
-  ZEN_GEN_5, /* Zen5 (SVI3)                */
+  ZEN_GEN_1,
+  ZEN_GEN_2,
+  ZEN_GEN_3,
+  ZEN_GEN_4,
+  ZEN_GEN_5,
 };
 
-/* ── Driver private data ─────────────────────────────────────────────────── */
+enum svi_version {
+  SVI_VER_2,
+  SVI_VER_3,
+};
+
+/* ---- Driver private data ------------------------------------------------- */
 
 struct zenpower_data {
   struct pci_dev *pdev;
   void (*read_amdsmn_addr)(struct pci_dev *pdev, u16 node_id, u32 address,
                            u32 *regval);
+
   u32 svi_core_addr;
   u32 svi_soc_addr;
   u16 node_id;
   u8 cpu_id;
   u8 nodes_per_cpu;
   int temp_offset;
+
   enum zen_generation zen_gen;
+  enum svi_version svi_ver;
+
   bool is_apu;
   bool kernel_smn_support;
   bool amps_visible;
   bool ccd_visible[MAX_CCD];
+
+  /* SMU power channel visibility (probed at boot) */
+  bool ppt_visible;
+  bool tdc_visible;
+  bool edc_visible;
+
+  u32 smu_ppt_addr;
+  u32 smu_tdc_addr;
+  u32 smu_edc_addr;
+
+  /*
+   * true  => SMU register holds IEEE-754 float watts  (Zen4/5)
+   * false => SMU register holds integer milliwatts    (Zen2/3)
+   */
+  bool smu_float_power;
 };
 
-/* ── Tctl offsets for specific SKUs ─────────────────────────────────────── */
+/* ---- Tctl offsets -------------------------------------------------------- */
 
 struct tctl_offset {
   u8 family;   /* x86 family: 0x17 or 0x19 */
@@ -208,153 +280,235 @@ struct tctl_offset {
 };
 
 static const struct tctl_offset tctl_offset_table[] = {
-    /* Zen / Zen+ desktop */
     {0x17, 0x01, 0x01, "AMD Ryzen 5 1600X", 20000},
     {0x17, 0x01, 0x01, "AMD Ryzen 7 1700X", 20000},
     {0x17, 0x01, 0x01, "AMD Ryzen 7 1800X", 20000},
     {0x17, 0x08, 0x08, "AMD Ryzen 7 2700X", 10000},
-    /* Zen Threadripper */
-    {0x17, 0x01, 0x01, "AMD Ryzen Threadripper 19",
-     27000}, /* 1900X/1920X/1950X */
-    {0x17, 0x01, 0x01, "AMD Ryzen Threadripper 29",
-     27000}, /* 2920X/2950X/2970WX/2990WX */
-    /* Zen2 desktop – no offset needed (Tdie == junction) */
-    /* Zen3 desktop */
-    {0x19, 0x21, 0x21, "AMD Ryzen 9 5900X", 0},
-    {0x19, 0x21, 0x21, "AMD Ryzen 9 5950X", 0},
-    /* Zen3 Threadripper / PRO */
+    {0x17, 0x01, 0x01, "AMD Ryzen Threadripper 19", 27000},
+    {0x17, 0x01, 0x01, "AMD Ryzen Threadripper 29", 27000},
     {0x19, 0x00, 0x01, "AMD Ryzen Threadripper PRO 59", 27000},
     {0x19, 0x00, 0x01, "AMD Ryzen Threadripper 59", 27000},
 };
 
-/* ── Mutex & multi-CPU state ─────────────────────────────────────────────── */
-
 static DEFINE_MUTEX(nb_smu_ind_mutex);
 static bool multicpu;
 
-/* ── hwmon visibility ────────────────────────────────────────────────────── */
+/* ---- SMN access backends ------------------------------------------------- */
 
-static umode_t zenpower_is_visible(const void *rdata,
-                                   enum hwmon_sensor_types type, u32 attr,
-                                   int channel) {
-  const struct zenpower_data *data = rdata;
-
-  switch (type) {
-  case hwmon_temp:
-    /* Tccd1-8 (channels 2..9): hide if not detected */
-    if (channel >= 2 && !data->ccd_visible[channel - 2])
-      return 0;
-    break;
-
-  case hwmon_curr:
-  case hwmon_power:
-    if (!data->amps_visible)
-      return 0;
-    if (channel == 0 && !data->svi_core_addr)
-      return 0;
-    if (channel == 1 && !data->svi_soc_addr)
-      return 0;
-    break;
-
-  case hwmon_in:
-    if (channel == 0) /* padding for index alignment */
-      return 0;
-    if (channel == 1 && !data->svi_core_addr)
-      return 0;
-    if (channel == 2 && !data->svi_soc_addr)
-      return 0;
-    break;
-
-  default:
-    break;
-  }
-
-  return 0444;
+static void kernel_smn_read(struct pci_dev *pdev, u16 node_id, u32 address,
+                            u32 *regval) {
+  amd_smn_read(node_id, address, regval);
 }
 
-/* ── SVI2 decode helpers ─────────────────────────────────────────────────── */
+/* Fallback: PCI index pair -- may be inaccurate on multi-die chips */
+static void nb_index_read(struct pci_dev *pdev, u16 node_id, u32 address,
+                          u32 *regval) {
+  mutex_lock(&nb_smu_ind_mutex);
+  pci_bus_write_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x60, address);
+  pci_bus_read_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x64, regval);
+  mutex_unlock(&nb_smu_ind_mutex);
+}
+
+/* ---- SVI2 decode --------------------------------------------------------- */
 /*
- * SVI2 voltage: bits [23:16] = VDDcor
- *   U (mV) = 1550 - 6.25 * VDDcor
+ * Voltage bits[23:16] = VDDcor
+ *   V (mV) = 1550 - 6.25 * VDDcor
+ *
+ * Core current bits[7:0] = IDDcor
+ *   Zen/Zen+:  I (mA) = 1039.211 * IDDcor
+ *   Zen2/3:    I (mA) =  658.823 * IDDcor
+ *
+ * SoC current bits[7:0] = IDDcor
+ *   Zen/Zen+:  I (mA) =  360.772 * IDDcor
+ *   Zen2/3:    I (mA) =  294.3   * IDDcor
  */
-static u32 svi2_plane_to_vcc(u32 p) {
+static u32 svi2_to_vcc(u32 p) {
   u32 vdd = (p >> 16) & 0xff;
 
   return 1550 - ((625 * vdd) / 100);
 }
 
-/*
- * SVI2 current: bits [7:0] = IDDcor
- *   Zen/Zen+ core:  I (mA) = 1039.211 * IDDcor
- *   Zen2/3 core:    I (mA) =  658.823 * IDDcor
- *   Zen/Zen+ SoC:   I (mA) =  360.772 * IDDcor
- *   Zen2/3 SoC:     I (mA) =  294.3   * IDDcor
- */
-static u32 svi2_get_core_current(u32 plane, enum zen_generation gen) {
-  u32 idd = plane & 0xff;
+static u32 svi2_core_ma(u32 p, enum zen_generation gen) {
+  u32 idd = p & 0xff;
   u32 fc = (gen >= ZEN_GEN_2) ? 658823 : 1039211;
 
   return (fc * idd) / 1000;
 }
 
-static u32 svi2_get_soc_current(u32 plane, enum zen_generation gen) {
-  u32 idd = plane & 0xff;
+static u32 svi2_soc_ma(u32 p, enum zen_generation gen) {
+  u32 idd = p & 0xff;
   u32 fc = (gen >= ZEN_GEN_2) ? 294300 : 360772;
 
   return (fc * idd) / 1000;
 }
 
-/* ── SVI3 decode helpers (Zen4 / Zen5) ──────────────────────────────────── */
-/*
- * SVI3 voltage: bits [15:8] = VDDcor (8-bit field, 0-based)
- *   U (mV) = 245 - 1.065 * VDDcor     (desktop Raphael / Granite Ridge)
- * For APU the range is slightly different but same formula holds.
- * Multiply by 1000 to keep mV integer arithmetic:
- *   U (µV) = 245000 - 1065 * VDDcor   → return mV = (245000 - 1065*vdd) / 1000
- * Note: community-verified on Ryzen 7 7700X and 9700X.
+/* ---- SVI3 decode (Zen4/Zen5, community-verified on Raphael + Granite Ridge)
  */
-static u32 svi3_plane_to_vcc(u32 p) {
+/*
+ * Voltage bits[15:8] = VDDcor
+ *   V (mV) = 245 - 1.065 * VDDcor
+ *
+ * Current bits[6:0] = IDDcor (7-bit)
+ *   Core I (mA) = 1000 * IDDcor / 4
+ *   SoC  I (mA) =  350 * IDDcor / 4
+ *
+ * NOTE: APU rail scaling may vary by SKU; these are best-available
+ * community coefficients.  Use force_svi2 if readings look wrong.
+ */
+static u32 svi3_to_vcc(u32 p) {
   u32 vdd = (p >> 8) & 0xff;
-  u32 uv = 245000 - 1065 * vdd; /* µV */
+  u32 uv = 245000 - 1065 * vdd; /* integer microvolt arithmetic */
 
-  return uv / 1000; /* mV */
+  return uv / 1000;
+}
+
+static u32 svi3_core_ma(u32 p) { return (1000 * (p & 0x7f)) / 4; }
+
+static u32 svi3_soc_ma(u32 p) { return (350 * (p & 0x7f)) / 4; }
+
+/* ---- Protocol-agnostic dispatch ----------------------------------------- */
+
+static u32 plane_to_vcc_mv(u32 p, const struct zenpower_data *d) {
+  return (d->svi_ver == SVI_VER_3) ? svi3_to_vcc(p) : svi2_to_vcc(p);
+}
+
+static u32 plane_core_ma(u32 p, const struct zenpower_data *d) {
+  return (d->svi_ver == SVI_VER_3) ? svi3_core_ma(p)
+                                   : svi2_core_ma(p, d->zen_gen);
+}
+
+static u32 plane_soc_ma(u32 p, const struct zenpower_data *d) {
+  return (d->svi_ver == SVI_VER_3) ? svi3_soc_ma(p)
+                                   : svi2_soc_ma(p, d->zen_gen);
 }
 
 /*
- * SVI3 current: bits [7:0] = IDDcor (7-bit meaningful, LSB reserved on some)
- *   Core I (mA) = 1000 * IDDcor / 4    (desktop)
- *   SoC  I (mA) =  350 * IDDcor / 4    (desktop SoC rail)
- * APU rails differ; these are best-effort approximations.
+ * safe_power_uw() -- overflow-safe µW calculation.
+ *
+ * mA * mV = 10^-3 A * 10^-3 V = 10^-6 W = µW.
+ *
+ * At Threadripper/EPYC extremes (300 A * 1.4 V = 420 W = 420,000,000 µW)
+ * a u32 product overflows at ~4295 W and a signed 32-bit long overflows at
+ * ~2147 W.  Promote to u64 and clamp to LONG_MAX so the hwmon layer is safe.
  */
-static u32 svi3_get_core_current(u32 plane) {
-  u32 idd = plane & 0x7f; /* 7-bit */
+static long safe_power_uw(u32 ma, u32 mv) {
+  u64 uw = (u64)ma * (u64)mv;
 
-  return (1000 * idd) / 4; /* mA */
+  return (uw > (u64)LONG_MAX) ? LONG_MAX : (long)uw;
 }
 
-static u32 svi3_get_soc_current(u32 plane) {
-  u32 idd = plane & 0x7f;
+/* ---- SMU float conversion ------------------------------------------------ */
+/*
+ * Zen4/5 SMU metrics registers hold power as IEEE-754 single-precision float
+ * in watts.  We convert to microwatts using integer arithmetic only, avoiding
+ * soft-float ABI issues on kernel builds without FPU.
+ *
+ * float layout: [31] sign | [30:23] biased exponent | [22:0] mantissa
+ */
+static long smu_float_to_uw(u32 raw) {
+  u32 sign = (raw >> 31) & 1;
+  s32 exp = (s32)((raw >> 23) & 0xff) - 127;
+  u32 mantissa = (raw & 0x7fffff) | 0x800000; /* implicit leading 1 */
+  u64 watts_sc; /* watts * 2^23 represented as integer */
 
-  return (350 * idd) / 4; /* mA */
+  /* Reject: negative, zero, infinity/NaN (exp=0xff), out-of-range exponents */
+  if (sign || raw == 0 || ((raw >> 23) & 0xff) == 0xff)
+    return 0;
+  if (exp < -10 || exp > 20)
+    return 0;
+
+  if (exp >= 23)
+    watts_sc = (u64)mantissa << (u32)(exp - 23);
+  else
+    watts_sc = (u64)mantissa >> (u32)(23 - exp);
+
+  /* watts -> µW: * 1,000,000 */
+  return (long)min_t(u64, watts_sc * 1000000ULL, (u64)LONG_MAX);
 }
 
-/* ── Dispatch helpers ────────────────────────────────────────────────────── */
+static long read_smu_power_uw(struct zenpower_data *data, u32 addr) {
+  u32 raw;
 
-static u32 plane_to_vcc(u32 p, enum zen_generation gen) {
-  return (gen >= ZEN_GEN_4) ? svi3_plane_to_vcc(p) : svi2_plane_to_vcc(p);
+  if (!addr)
+    return 0;
+
+  data->read_amdsmn_addr(data->pdev, data->node_id, addr, &raw);
+
+  if (raw == SMU_REG_SENTINEL_FF || raw == SMU_REG_SENTINEL_00)
+    return 0;
+
+  if (data->smu_float_power)
+    return smu_float_to_uw(raw);
+
+  /* Integer milliwatts -> µW, clamped */
+  return (long)min_t(u64, (u64)raw * 1000ULL, (u64)LONG_MAX);
 }
 
-static u32 get_core_current(u32 p, enum zen_generation gen) {
-  return (gen >= ZEN_GEN_4) ? svi3_get_core_current(p)
-                            : svi2_get_core_current(p, gen);
+/* ---- SVI protocol auto-detection ---------------------------------------- */
+/*
+ * Strategy:
+ *  1. Start with the generation-presumed SVI version from the model table.
+ *  2. Read the core plane register and decode voltage under the presumed
+ * version.
+ *  3. If the result falls outside SVI_VOLTAGE_MIN_MV..SVI_VOLTAGE_MAX_MV,
+ *     try the alternate version.
+ *  4. If neither gives a plausible value (CPU idle / rail parked), keep the
+ *     model-table presumption -- we cannot override with ambiguous data.
+ *
+ *  force_svi2 / force_svi3 module params bypass this entirely.
+ */
+static enum svi_version detect_svi_version(struct zenpower_data *data,
+                                           enum svi_version presumed) {
+  u32 plane, mv;
+
+  if (force_svi2)
+    return SVI_VER_2;
+  if (force_svi3)
+    return SVI_VER_3;
+  if (!data->svi_core_addr)
+    return presumed;
+
+  data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
+                         &plane);
+
+  /* Test presumed version */
+  mv = (presumed == SVI_VER_3) ? svi3_to_vcc(plane) : svi2_to_vcc(plane);
+  if (mv >= SVI_VOLTAGE_MIN_MV && mv <= SVI_VOLTAGE_MAX_MV)
+    return presumed;
+
+  /* Test alternate */
+  {
+    enum svi_version alt = (presumed == SVI_VER_3) ? SVI_VER_2 : SVI_VER_3;
+    mv = (alt == SVI_VER_3) ? svi3_to_vcc(plane) : svi2_to_vcc(plane);
+    if (mv >= SVI_VOLTAGE_MIN_MV && mv <= SVI_VOLTAGE_MAX_MV) {
+      pr_info("zenpower: SVI auto-detect: presumed SVI%d, plausibility "
+              "selects SVI%d (plane=0x%08x decoded_mv=%u)\n",
+              (presumed == SVI_VER_3) ? 3 : 2, (alt == SVI_VER_3) ? 3 : 2,
+              plane, mv);
+      return alt;
+    }
+  }
+
+  /* Ambiguous -- retain model-table presumption */
+  return presumed;
 }
 
-static u32 get_soc_current(u32 p, enum zen_generation gen) {
-  return (gen >= ZEN_GEN_4) ? svi3_get_soc_current(p)
-                            : svi2_get_soc_current(p, gen);
+/* ---- SMU register usability probe --------------------------------------- */
+/*
+ * Returns true if the SMU register at 'addr' returns a non-sentinel value
+ * that decodes to a physically plausible power in the range 1 mW..10 kW.
+ */
+static bool smu_reg_is_usable(struct zenpower_data *data, u32 addr) {
+  long uw;
+
+  if (!addr)
+    return false;
+  uw = read_smu_power_uw(data, addr);
+  /* Accept 1 uW to 10 kW */
+  return (uw > 0 && uw <= 10000LL * 1000000LL);
 }
 
-/* ── Temperature reading ─────────────────────────────────────────────────── */
+/* ---- Temperature reading ------------------------------------------------- */
 
 static unsigned int get_ctl_temp(struct zenpower_data *data) {
   u32 regval;
@@ -368,48 +522,67 @@ static unsigned int get_ctl_temp(struct zenpower_data *data) {
   return temp;
 }
 
-static unsigned int get_ccd_temp(struct zenpower_data *data, u32 ccd_addr) {
+static unsigned int get_ccd_temp(struct zenpower_data *data, u32 addr) {
   u32 regval;
 
-  data->read_amdsmn_addr(data->pdev, data->node_id, ccd_addr, &regval);
-  return (regval & 0xfff) * 125 - 305000;
+  data->read_amdsmn_addr(data->pdev, data->node_id, addr, &regval);
+  return (regval & ZEN_CCD_TEMP_VALID_MASK) * 125 - 305000;
 }
 
-/* ── Debug sysfs ─────────────────────────────────────────────────────────── */
+/* ---- hwmon visibility ---------------------------------------------------- */
 
-static const int debug_addrs_arr[] = {
-    F17H_M01H_SVI + 0x08,  F17H_M01H_SVI + 0x0C,  F17H_M01H_SVI + 0x10,
-    F17H_M01H_SVI + 0x14,  ZEN_SMU_CORE_PWR_ADDR, ZEN_SMU_SOC_PWR_ADDR,
-    F17H_M70H_CCD_TEMP(0), F17H_M70H_CCD_TEMP(1), F17H_M70H_CCD_TEMP(2),
-    F17H_M70H_CCD_TEMP(3), F17H_M70H_CCD_TEMP(4), F17H_M70H_CCD_TEMP(5),
-    F17H_M70H_CCD_TEMP(6), F17H_M70H_CCD_TEMP(7),
-};
+static umode_t zenpower_is_visible(const void *rdata,
+                                   enum hwmon_sensor_types type, u32 attr,
+                                   int channel) {
+  const struct zenpower_data *data = rdata;
 
-static ssize_t debug_data_show(struct device *dev,
-                               struct device_attribute *attr, char *buf) {
-  struct zenpower_data *data = dev_get_drvdata(dev);
-  int i, len = 0;
-  u32 smndata;
+  switch (type) {
+  case hwmon_temp:
+    if (channel >= 2 && !data->ccd_visible[channel - 2])
+      return 0;
+    break;
 
-  len += sprintf(buf + len, "KERN_SUP:  %d\n", data->kernel_smn_support);
-  len += sprintf(buf + len, "NODE %d; CPU %d; N/CPU: %d\n", data->node_id,
-                 data->cpu_id, data->nodes_per_cpu);
-  len += sprintf(buf + len, "ZEN_GEN:   %d\n", data->zen_gen);
-  len += sprintf(buf + len, "IS_APU:    %d\n", data->is_apu);
-  len += sprintf(buf + len, "AMPS_VIS:  %d\n", data->amps_visible);
-  len += sprintf(buf + len, "SVI_CORE:  %08x\n", data->svi_core_addr);
-  len += sprintf(buf + len, "SVI_SOC:   %08x\n", data->svi_soc_addr);
+  case hwmon_curr:
+    if (!data->amps_visible)
+      return 0;
+    if (channel == 0 && !data->svi_core_addr)
+      return 0;
+    if (channel == 1 && !data->svi_soc_addr)
+      return 0;
+    break;
 
-  for (i = 0; i < ARRAY_SIZE(debug_addrs_arr); i++) {
-    data->read_amdsmn_addr(data->pdev, data->node_id, debug_addrs_arr[i],
-                           &smndata);
-    len += sprintf(buf + len, "%08x = %08x\n", debug_addrs_arr[i], smndata);
+  case hwmon_in:
+    if (channel == 0)
+      return 0; /* padding */
+    if (channel == 1 && !data->svi_core_addr)
+      return 0;
+    if (channel == 2 && !data->svi_soc_addr)
+      return 0;
+    break;
+
+  case hwmon_power:
+    if (channel <= 1 && !data->amps_visible)
+      return 0;
+    if (channel == 0 && !data->svi_core_addr)
+      return 0;
+    if (channel == 1 && !data->svi_soc_addr)
+      return 0;
+    if (channel == 2 && !data->ppt_visible)
+      return 0;
+    if (channel == 3 && !data->tdc_visible)
+      return 0;
+    if (channel == 4 && !data->edc_visible)
+      return 0;
+    break;
+
+  default:
+    break;
   }
 
-  return len;
+  return 0444;
 }
 
-/* ── hwmon read ──────────────────────────────────────────────────────────── */
+/* ---- hwmon read ---------------------------------------------------------- */
 
 static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
                          u32 attr, int channel, long *val) {
@@ -418,44 +591,40 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
 
   switch (type) {
 
-  /* ── Temperatures ──────────────────────────────────────────────── */
+  /* Temperatures */
   case hwmon_temp:
     if (attr == hwmon_temp_max) {
-      /* Tdie max: 95 °C per AMD specs */
-      *val = 95 * 1000;
+      *val = 95000;
       return 0;
     }
     if (attr != hwmon_temp_input)
       return -EOPNOTSUPP;
 
     switch (channel) {
-    case 0: /* Tdie */
+    case 0:
       *val = get_ctl_temp(data) - data->temp_offset;
       break;
-    case 1: /* Tctl */
+    case 1:
       *val = get_ctl_temp(data);
       break;
-    case 2 ... 9: /* Tccd1-8 */
-      *val = get_ccd_temp(data, F17H_M70H_CCD_TEMP(channel - 2));
+    case 2 ... 9:
+      *val = get_ccd_temp(data, ZEN_CCD_TEMP(channel - 2));
       break;
     default:
       return -EOPNOTSUPP;
     }
     break;
 
-  /* ── Voltage (hwmon_in uses 0-based indexing, we pad ch 0) ─────── */
+  /* Voltage (hwmon_in uses 0-based indexing; pad ch0 to align with SVI) */
   case hwmon_in:
     if (channel == 0)
       return -EOPNOTSUPP;
     channel -= 1;
-    /* fall through into shared current/power/voltage handler */
     fallthrough;
 
-  /* ── Current / Power ───────────────────────────────────────────── */
+  /* Current */
   case hwmon_curr:
-  case hwmon_power:
-    if (attr != hwmon_in_input && attr != hwmon_curr_input &&
-        attr != hwmon_power_input)
+    if (attr != hwmon_in_input && attr != hwmon_curr_input)
       return -EOPNOTSUPP;
 
     switch (channel) {
@@ -471,31 +640,92 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
       return -EOPNOTSUPP;
     }
 
-    switch (type) {
-    case hwmon_in:
-      /* millivolts */
-      *val = plane_to_vcc(plane, data->zen_gen);
+    *val = (type == hwmon_in) ? plane_to_vcc_mv(plane, data)
+                              : ((channel == 0) ? plane_core_ma(plane, data)
+                                                : plane_soc_ma(plane, data));
+    break;
+
+  /* Power */
+  case hwmon_power:
+    if (attr != hwmon_power_input)
+      return -EOPNOTSUPP;
+
+    switch (channel) {
+    /*
+     * ch0 / ch1: SVI VRM rail power in uW.
+     *
+     * This is what the voltage regulator reports it is delivering.
+     * It is NOT the same as PPT -- it includes VRM conversion losses
+     * and does not reflect the SMU power governance limit.
+     */
+    case 0:
+      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
+                             &plane);
+      *val = safe_power_uw(plane_core_ma(plane, data),
+                           plane_to_vcc_mv(plane, data));
       break;
-    case hwmon_curr:
-      /* milliamps */
-      *val = (channel == 0) ? get_core_current(plane, data->zen_gen)
-                            : get_soc_current(plane, data->zen_gen);
+    case 1:
+      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_soc_addr,
+                             &plane);
+      *val = safe_power_uw(plane_soc_ma(plane, data),
+                           plane_to_vcc_mv(plane, data));
       break;
-    case hwmon_power:
-      /*
-       * Power in microwatts (µW):
-       *   mA * mV = 10⁻³A * 10⁻³V = 10⁻⁶W = µW  ✓
-       */
-      if (channel == 0) {
-        *val = (long)get_core_current(plane, data->zen_gen) *
-               plane_to_vcc(plane, data->zen_gen);
-      } else {
-        *val = (long)get_soc_current(plane, data->zen_gen) *
-               plane_to_vcc(plane, data->zen_gen);
-      }
+
+    /*
+     * ch2: Package PPT -- SMU-governed whole-package power limit.
+     *
+     * This is silicon power as AMD defines it (what you see in
+     * HWiNFO / Ryzen Master as "Package Power").  It is a different
+     * physical quantity from the VRM rail readings above.
+     *
+     * Units: uW.  Converted from SMU register (integer mW or float W).
+     */
+    case 2:
+      *val = read_smu_power_uw(data, data->smu_ppt_addr);
       break;
+
+    /*
+     * ch3: TDC proxy -- sustained current limit x current Vcore.
+     *
+     * The TDC register holds the sustained current ceiling in amps
+     * (8.3 fixed-point format: bits[10:3] = integer amps).
+     * We multiply by the live Vcore reading to produce a power proxy.
+     * This is informational -- it represents headroom, not consumption.
+     */
+    case 3: {
+      u32 tdc_raw, vcore_plane, tdc_ma, mv;
+
+      data->read_amdsmn_addr(data->pdev, data->node_id, data->smu_tdc_addr,
+                             &tdc_raw);
+      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
+                             &vcore_plane);
+      tdc_ma = ((tdc_raw >> 3) & 0xff) * 1000;
+      mv = plane_to_vcc_mv(vcore_plane, data);
+      *val = safe_power_uw(tdc_ma, mv);
+      break;
+    }
+
+    /*
+     * ch4: EDC proxy -- peak (electrical design current) limit x Vcore.
+     *
+     * Same construction as TDC but for the short-burst ceiling.
+     * Represents peak allowable power envelope for boost transients.
+     */
+    case 4: {
+      u32 edc_raw, vcore_plane, edc_ma, mv;
+
+      data->read_amdsmn_addr(data->pdev, data->node_id, data->smu_edc_addr,
+                             &edc_raw);
+      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
+                             &vcore_plane);
+      edc_ma = ((edc_raw >> 3) & 0xff) * 1000;
+      mv = plane_to_vcc_mv(vcore_plane, data);
+      *val = safe_power_uw(edc_ma, mv);
+      break;
+    }
+
     default:
-      break;
+      return -EOPNOTSUPP;
     }
     break;
 
@@ -506,7 +736,7 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
   return 0;
 }
 
-/* ── hwmon label tables ──────────────────────────────────────────────────── */
+/* ---- Label tables -------------------------------------------------------- */
 
 static const char *const zenpower_temp_label[][10] = {
     {"Tdie", "Tctl", "Tccd1", "Tccd2", "Tccd3", "Tccd4", "Tccd5", "Tccd6",
@@ -529,10 +759,36 @@ static const char *const zenpower_curr_label[][2] = {
     {"cpu1 SVI_C_Core", "cpu1 SVI_C_SoC"},
 };
 
-static const char *const zenpower_power_label[][2] = {
-    {"SVI_P_Core", "SVI_P_SoC"},
-    {"cpu0 SVI_P_Core", "cpu0 SVI_P_SoC"},
-    {"cpu1 SVI_P_Core", "cpu1 SVI_P_SoC"},
+/*
+ * Power channel labels match the channel indices in zenpower_read():
+ *   [0] Core VRM rail power  (ch0)
+ *   [1] SoC  VRM rail power  (ch1)
+ *   [2] Package PPT          (ch2)
+ *   [3] TDC x Vcore proxy    (ch3)
+ *   [4] EDC x Vcore proxy    (ch4)
+ */
+static const char *const zenpower_power_label[][5] = {
+    {
+        "SVI_P_Core",
+        "SVI_P_SoC",
+        "PPT_Package",
+        "TDC_Core_proxy",
+        "EDC_Core_proxy",
+    },
+    {
+        "cpu0 SVI_P_Core",
+        "cpu0 SVI_P_SoC",
+        "cpu0 PPT_Package",
+        "cpu0 TDC_Core_proxy",
+        "cpu0 EDC_Core_proxy",
+    },
+    {
+        "cpu1 SVI_P_Core",
+        "cpu1 SVI_P_SoC",
+        "cpu1 PPT_Package",
+        "cpu1 TDC_Core_proxy",
+        "cpu1 EDC_Core_proxy",
+    },
 };
 
 static int zenpower_read_labels(struct device *dev,
@@ -566,48 +822,77 @@ static int zenpower_read_labels(struct device *dev,
   return 0;
 }
 
-/* ── SMN access backends ─────────────────────────────────────────────────── */
+/* ---- Debug sysfs --------------------------------------------------------- */
 
-static void kernel_smn_read(struct pci_dev *pdev, u16 node_id, u32 address,
-                            u32 *regval) {
-  amd_smn_read(node_id, address, regval);
+static const u32 debug_addrs[] = {
+    F17H_M01H_SVI + 0x08,  F17H_M01H_SVI + 0x0C,  F17H_M01H_SVI + 0x10,
+    F17H_M01H_SVI + 0x14,  ZEN_SMU_PKG_PPT_ADDR,  ZEN_SMU_SOC_PPT_ADDR,
+    ZEN_SMU_CORE_TDC_ADDR, ZEN_SMU_CORE_EDC_ADDR, ZEN_CCD_TEMP(0),
+    ZEN_CCD_TEMP(1),       ZEN_CCD_TEMP(2),       ZEN_CCD_TEMP(3),
+    ZEN_CCD_TEMP(4),       ZEN_CCD_TEMP(5),       ZEN_CCD_TEMP(6),
+    ZEN_CCD_TEMP(7),
+};
+
+static ssize_t debug_data_show(struct device *dev,
+                               struct device_attribute *attr, char *buf) {
+  struct zenpower_data *data = dev_get_drvdata(dev);
+  int i, len = 0;
+  u32 raw;
+
+  len += sprintf(buf + len, "KERN_SUP:   %d\n", data->kernel_smn_support);
+  len += sprintf(buf + len, "NODE %u; CPU %u; N/CPU: %u\n", data->node_id,
+                 data->cpu_id, data->nodes_per_cpu);
+  len += sprintf(buf + len, "ZEN_GEN:    %d\n", (int)data->zen_gen);
+  len += sprintf(buf + len, "SVI_VER:    %d\n",
+                 (data->svi_ver == SVI_VER_3) ? 3 : 2);
+  len += sprintf(buf + len, "IS_APU:     %d\n", data->is_apu);
+  len += sprintf(buf + len, "AMPS_VIS:   %d\n", data->amps_visible);
+  len += sprintf(buf + len, "PPT_VIS:    %d\n", data->ppt_visible);
+  len += sprintf(buf + len, "TDC_VIS:    %d\n", data->tdc_visible);
+  len += sprintf(buf + len, "EDC_VIS:    %d\n", data->edc_visible);
+  len += sprintf(buf + len, "FLOAT_PWR:  %d\n", data->smu_float_power);
+  len += sprintf(buf + len, "SVI_CORE:   %08x\n", data->svi_core_addr);
+  len += sprintf(buf + len, "SVI_SOC:    %08x\n", data->svi_soc_addr);
+  len += sprintf(buf + len, "SMU_PPT:    %08x\n", data->smu_ppt_addr);
+  len += sprintf(buf + len, "SMU_TDC:    %08x\n", data->smu_tdc_addr);
+  len += sprintf(buf + len, "SMU_EDC:    %08x\n", data->smu_edc_addr);
+  len += sprintf(buf + len, "---\n");
+
+  for (i = 0; i < ARRAY_SIZE(debug_addrs); i++) {
+    data->read_amdsmn_addr(data->pdev, data->node_id, debug_addrs[i], &raw);
+    len += sprintf(buf + len, "%08x = %08x\n", debug_addrs[i], raw);
+  }
+  return len;
 }
 
-/* Fallback from k10temp – may give inaccurate results on multi-die chips */
-static void nb_index_read(struct pci_dev *pdev, u16 node_id, u32 address,
-                          u32 *regval) {
-  mutex_lock(&nb_smu_ind_mutex);
-  pci_bus_write_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x60, address);
-  pci_bus_read_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x64, regval);
-  mutex_unlock(&nb_smu_ind_mutex);
-}
-
-/* ── hwmon channel descriptors ───────────────────────────────────────────── */
+/* ---- hwmon channel descriptors ------------------------------------------- */
 
 static const struct hwmon_channel_info *zenpower_info[] = {
-    HWMON_CHANNEL_INFO(
-        temp, HWMON_T_INPUT | HWMON_T_MAX | HWMON_T_LABEL, /* Tdie  (ch0) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tctl  (ch1) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd1 (ch2) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd2 (ch3) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd3 (ch4) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd4 (ch5) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd5 (ch6) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd6 (ch7) */
-        HWMON_T_INPUT | HWMON_T_LABEL,                     /* Tccd7 (ch8) */
-        HWMON_T_INPUT | HWMON_T_LABEL),                    /* Tccd8 (ch9) */
+    HWMON_CHANNEL_INFO(temp,
+                       HWMON_T_INPUT | HWMON_T_MAX | HWMON_T_LABEL, /* Tdie  */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tctl  */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd1 */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd2 */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd3 */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd4 */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd5 */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd6 */
+                       HWMON_T_INPUT | HWMON_T_LABEL,               /* Tccd7 */
+                       HWMON_T_INPUT | HWMON_T_LABEL),              /* Tccd8 */
 
-    HWMON_CHANNEL_INFO(in, HWMON_I_LABEL,              /* pad  (ch0 – hidden) */
-                       HWMON_I_INPUT | HWMON_I_LABEL,  /* Core voltage (ch1)  */
-                       HWMON_I_INPUT | HWMON_I_LABEL), /* SoC  voltage (ch2)  */
+    HWMON_CHANNEL_INFO(in, HWMON_I_LABEL,              /* pad (ch0 hidden) */
+                       HWMON_I_INPUT | HWMON_I_LABEL,  /* Core voltage     */
+                       HWMON_I_INPUT | HWMON_I_LABEL), /* SoC  voltage     */
 
-    HWMON_CHANNEL_INFO(curr,
-                       HWMON_C_INPUT | HWMON_C_LABEL,  /* Core current (ch0)  */
-                       HWMON_C_INPUT | HWMON_C_LABEL), /* SoC  current (ch1)  */
+    HWMON_CHANNEL_INFO(curr, HWMON_C_INPUT | HWMON_C_LABEL, /* Core current */
+                       HWMON_C_INPUT | HWMON_C_LABEL), /* SoC  current     */
 
     HWMON_CHANNEL_INFO(power,
-                       HWMON_P_INPUT | HWMON_P_LABEL,  /* Core power   (ch0)  */
-                       HWMON_P_INPUT | HWMON_P_LABEL), /* SoC  power   (ch1)  */
+                       HWMON_P_INPUT | HWMON_P_LABEL,  /* Core rail power  */
+                       HWMON_P_INPUT | HWMON_P_LABEL,  /* SoC  rail power  */
+                       HWMON_P_INPUT | HWMON_P_LABEL,  /* PPT package      */
+                       HWMON_P_INPUT | HWMON_P_LABEL,  /* TDC proxy        */
+                       HWMON_P_INPUT | HWMON_P_LABEL), /* EDC proxy        */
 
     NULL};
 
@@ -622,7 +907,7 @@ static const struct hwmon_chip_info zenpower_chip_info = {
     .info = zenpower_info,
 };
 
-/* ── sysfs extras ────────────────────────────────────────────────────────── */
+/* ---- sysfs extras -------------------------------------------------------- */
 
 static DEVICE_ATTR_RO(debug_data);
 
@@ -630,7 +915,7 @@ static struct attribute *zenpower_attrs[] = {&dev_attr_debug_data.attr, NULL};
 static const struct attribute_group zenpower_group = {.attrs = zenpower_attrs};
 __ATTRIBUTE_GROUPS(zenpower);
 
-/* ── probe ───────────────────────────────────────────────────────────────── */
+/* ---- probe --------------------------------------------------------------- */
 
 static int zenpower_probe(struct pci_dev *pdev,
                           const struct pci_device_id *id) {
@@ -638,9 +923,10 @@ static int zenpower_probe(struct pci_dev *pdev,
   struct zenpower_data *data;
   struct device *hwmon_dev;
   struct pci_dev *misc;
-  int i, ccd_check = 0;
+  enum svi_version presumed_svi = SVI_VER_2;
   bool multinode;
   u8 node_of_cpu;
+  int i, ccd_check = 0;
   u32 val;
 
   data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
@@ -648,17 +934,21 @@ static int zenpower_probe(struct pci_dev *pdev,
     return -ENOMEM;
 
   data->pdev = pdev;
-  data->zen_gen = ZEN_GEN_1; /* safe default */
-  data->is_apu = false;
+  data->zen_gen = ZEN_GEN_1;
+  data->svi_ver = SVI_VER_2;
   data->read_amdsmn_addr = nb_index_read;
   data->kernel_smn_support = false;
   data->amps_visible = false;
+  data->ppt_visible = false;
+  data->tdc_visible = false;
+  data->edc_visible = false;
+  data->smu_float_power = false;
   data->temp_offset = 0;
   data->node_id = 0;
   for (i = 0; i < MAX_CCD; i++)
     data->ccd_visible[i] = false;
 
-  /* Prefer kernel amd_smn_read() over the PCI index hack */
+  /* Prefer kernel amd_smn_read() */
   for (i = 0; i < amd_nb_num(); i++) {
     misc = node_to_amd_nb(i)->misc;
     if (pdev->vendor == misc->vendor && pdev->device == misc->device) {
@@ -678,43 +968,46 @@ static int zenpower_probe(struct pci_dev *pdev,
   if (data->cpu_id > 0)
     multicpu = true;
 
-  /* ──────────────────────────────────────────────────────────────
-   * Per-family, per-model configuration
-   * ────────────────────────────────────────────────────────────── */
+  /* Default SMU addresses -- overridden per generation where known */
+  data->smu_ppt_addr = ZEN_SMU_PKG_PPT_ADDR;
+  data->smu_tdc_addr = ZEN_SMU_CORE_TDC_ADDR;
+  data->smu_edc_addr = ZEN_SMU_CORE_EDC_ADDR;
+
+  /* ----------------------------------------------------------------
+   * Per-family, per-model initialisation
+   * ---------------------------------------------------------------- */
 
   if (boot_cpu_data.x86 == 0x17) {
     switch (boot_cpu_data.x86_model) {
 
-    case 0x01: /* Zen  – Ryzen 1000 / Naples EPYC */
-    case 0x08: /* Zen+ – Ryzen 2000 / Pinnacle Ridge */
+    case 0x01: /* Zen  -- Summit Ridge / Naples EPYC */
+    case 0x08: /* Zen+ -- Pinnacle Ridge             */
       data->zen_gen = ZEN_GEN_1;
       data->amps_visible = true;
-
-      if (multinode) { /* Threadripper / EPYC */
+      if (multinode) {
         if (node_of_cpu == 0)
           data->svi_soc_addr = F17H_M01H_SVI_TEL_PLANE0;
         if (node_of_cpu == 1)
           data->svi_core_addr = F17H_M01H_SVI_TEL_PLANE0;
-      } else { /* Normal Ryzen desktop */
+      } else {
         data->svi_core_addr = F17H_M01H_SVI_TEL_PLANE0;
         data->svi_soc_addr = F17H_M01H_SVI_TEL_PLANE1;
       }
       ccd_check = 4;
       break;
 
-    case 0x11: /* Zen  APU – Raven Ridge */
-    case 0x18: /* Zen+ APU – Picasso     */
+    case 0x11: /* Zen  APU -- Raven Ridge */
+    case 0x18: /* Zen+ APU -- Picasso     */
       data->zen_gen = ZEN_GEN_1;
       data->is_apu = true;
       data->amps_visible = true;
       data->svi_core_addr = F17H_M01H_SVI_TEL_PLANE0;
       data->svi_soc_addr = F17H_M01H_SVI_TEL_PLANE1;
-      /* APUs have no CCDs */
       break;
 
-    case 0x31: /* Zen2 – Castle Peak TR / Rome EPYC */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_2;
-      dev_info(dev, "Zen2 TR/EPYC: using %s formula\n",
+    case 0x31: /* Zen2 TR -- Castle Peak / Rome EPYC */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_2;
+      dev_info(dev, "Zen2 TR/EPYC (%s coefficients)\n",
                zen1_calc ? "Zen1" : "Zen2");
       data->amps_visible = true;
       data->svi_core_addr = F17H_M30H_SVI_TEL_PLANE0;
@@ -722,10 +1015,10 @@ static int zenpower_probe(struct pci_dev *pdev,
       ccd_check = 8;
       break;
 
-    case 0x60: /* Zen2 APU – Renoir  */
-    case 0x68: /* Zen2 APU – Lucienne */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_2;
-      dev_info(dev, "Zen2 APU: using %s formula\n",
+    case 0x60: /* Zen2 APU -- Renoir   */
+    case 0x68: /* Zen2 APU -- Lucienne */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_2;
+      dev_info(dev, "Zen2 Renoir/Lucienne APU (%s)\n",
                zen1_calc ? "Zen1" : "Zen2");
       data->is_apu = true;
       data->amps_visible = true;
@@ -733,9 +1026,9 @@ static int zenpower_probe(struct pci_dev *pdev,
       data->svi_soc_addr = F17H_M60H_SVI_TEL_PLANE1;
       break;
 
-    case 0x71: /* Zen2 – Matisse Ryzen 3000 */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_2;
-      dev_info(dev, "Zen2 Ryzen: using %s formula\n",
+    case 0x71: /* Zen2 -- Matisse Ryzen 3000 */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_2;
+      dev_info(dev, "Zen2 Matisse (%s coefficients)\n",
                zen1_calc ? "Zen1" : "Zen2");
       data->amps_visible = true;
       data->svi_core_addr = F17H_M70H_SVI_TEL_PLANE0;
@@ -743,19 +1036,17 @@ static int zenpower_probe(struct pci_dev *pdev,
       ccd_check = 8;
       break;
 
-    case 0x90: /* Zen2 APU – Van Gogh (Steam Deck) */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_2;
-      dev_info(dev, "Zen2 Van Gogh APU: using %s formula\n",
-               zen1_calc ? "Zen1" : "Zen2");
+    case 0x90: /* Zen2 APU -- Van Gogh (Steam Deck) */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_2;
+      dev_info(dev, "Zen2 Van Gogh APU (%s)\n", zen1_calc ? "Zen1" : "Zen2");
       data->is_apu = true;
       data->amps_visible = true;
-      /* Van Gogh uses same layout as Renoir */
       data->svi_core_addr = F17H_M60H_SVI_TEL_PLANE0;
       data->svi_soc_addr = F17H_M60H_SVI_TEL_PLANE1;
       break;
 
     default:
-      dev_warn(dev, "Unknown 17h model 0x%02x – using defaults\n",
+      dev_warn(dev, "Unknown 17h model 0x%02x -- Zen1 defaults\n",
                boot_cpu_data.x86_model);
       data->svi_core_addr = F17H_M01H_SVI_TEL_PLANE0;
       data->svi_soc_addr = F17H_M01H_SVI_TEL_PLANE1;
@@ -765,9 +1056,9 @@ static int zenpower_probe(struct pci_dev *pdev,
   } else if (boot_cpu_data.x86 == 0x19) {
     switch (boot_cpu_data.x86_model) {
 
-    case 0x00 ... 0x01: /* Zen3 – Milan EPYC / Chagall TR */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_3;
-      dev_info(dev, "Zen3 SP3/TR: using %s formula\n",
+    case 0x00 ... 0x01: /* Zen3 -- Milan EPYC / Chagall TR */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_3;
+      dev_info(dev, "Zen3 SP3/TR (%s coefficients)\n",
                zen1_calc ? "Zen1" : "Zen2-compat");
       data->amps_visible = true;
       data->svi_core_addr = F19H_M01H_SVI_TEL_PLANE0;
@@ -775,19 +1066,20 @@ static int zenpower_probe(struct pci_dev *pdev,
       ccd_check = 8;
       break;
 
-    case 0x10 ... 0x11: /* Zen4 – Genoa EPYC (SVI3) */
+    case 0x10 ... 0x11: /* Zen4 -- Genoa EPYC (SVI3) */
       data->zen_gen = ZEN_GEN_4;
+      presumed_svi = SVI_VER_3;
       data->amps_visible = true;
-      /* Genoa uses same register layout as Raphael for now */
       data->svi_core_addr = F19H_M61H_SVI3_TEL_PLANE0;
       data->svi_soc_addr = F19H_M61H_SVI3_TEL_PLANE1;
+      data->smu_float_power = true;
       ccd_check = 8;
       dev_info(dev, "Zen4 Genoa EPYC (SVI3)\n");
       break;
 
-    case 0x21: /* Zen3 – Vermeer Ryzen 5000 desktop */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_3;
-      dev_info(dev, "Zen3 Ryzen: using %s formula\n",
+    case 0x21: /* Zen3 -- Vermeer Ryzen 5000 */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_3;
+      dev_info(dev, "Zen3 Vermeer (%s coefficients)\n",
                zen1_calc ? "Zen1" : "Zen2-compat");
       data->amps_visible = true;
       data->svi_core_addr = F19H_M21H_SVI_TEL_PLANE0;
@@ -795,10 +1087,10 @@ static int zenpower_probe(struct pci_dev *pdev,
       ccd_check = 2;
       break;
 
-    case 0x40: /* Zen3+ APU – Rembrandt (Ryzen 6000) */
-    case 0x44: /* Zen3+ APU – Rembrandt-R             */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_3;
-      dev_info(dev, "Zen3+ Rembrandt APU: using %s formula\n",
+    case 0x40: /* Zen3+ APU -- Rembrandt   */
+    case 0x44: /* Zen3+ APU -- Rembrandt-R */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_3;
+      dev_info(dev, "Zen3+ Rembrandt APU (%s)\n",
                zen1_calc ? "Zen1" : "Zen2-compat");
       data->is_apu = true;
       data->amps_visible = true;
@@ -806,9 +1098,9 @@ static int zenpower_probe(struct pci_dev *pdev,
       data->svi_soc_addr = F19H_M50H_SVI_TEL_PLANE1;
       break;
 
-    case 0x50: /* Zen3 APU – Cezanne / Barcelo (Ryzen 5000U/G) */
-      data->zen_gen = (zen1_calc) ? ZEN_GEN_1 : ZEN_GEN_3;
-      dev_info(dev, "Zen3 Cezanne/Barcelo APU: using %s formula\n",
+    case 0x50: /* Zen3 APU -- Cezanne / Barcelo */
+      data->zen_gen = zen1_calc ? ZEN_GEN_1 : ZEN_GEN_3;
+      dev_info(dev, "Zen3 Cezanne/Barcelo APU (%s)\n",
                zen1_calc ? "Zen1" : "Zen2-compat");
       data->is_apu = true;
       data->amps_visible = true;
@@ -816,26 +1108,30 @@ static int zenpower_probe(struct pci_dev *pdev,
       data->svi_soc_addr = F19H_M50H_SVI_TEL_PLANE1;
       break;
 
-    case 0x61: /* Zen4 desktop – Raphael (Ryzen 7000) (SVI3) */
+    case 0x61: /* Zen4 desktop -- Raphael Ryzen 7000 (SVI3) */
       data->zen_gen = ZEN_GEN_4;
+      presumed_svi = SVI_VER_3;
       data->amps_visible = true;
       data->svi_core_addr = F19H_M61H_SVI3_TEL_PLANE0;
       data->svi_soc_addr = F19H_M61H_SVI3_TEL_PLANE1;
+      data->smu_float_power = true;
       ccd_check = 2;
       dev_info(dev, "Zen4 Raphael desktop (SVI3)\n");
       break;
 
-    case 0x70 ... 0x78: /* Zen4 APU – Phoenix / Hawk Point (SVI3) */
+    case 0x70 ... 0x78: /* Zen4 APU -- Phoenix / Hawk Point (SVI3) */
       data->zen_gen = ZEN_GEN_4;
+      presumed_svi = SVI_VER_3;
       data->is_apu = true;
       data->amps_visible = true;
       data->svi_core_addr = F19H_M70H_SVI3_TEL_PLANE0;
       data->svi_soc_addr = F19H_M70H_SVI3_TEL_PLANE1;
+      data->smu_float_power = true;
       dev_info(dev, "Zen4 Phoenix/HawkPoint APU (SVI3)\n");
       break;
 
     default:
-      dev_warn(dev, "Unknown 19h model 0x%02x – using Zen3 defaults\n",
+      dev_warn(dev, "Unknown 19h model 0x%02x -- Zen3 defaults\n",
                boot_cpu_data.x86_model);
       data->zen_gen = ZEN_GEN_3;
       data->svi_core_addr = F19H_M21H_SVI_TEL_PLANE0;
@@ -846,48 +1142,57 @@ static int zenpower_probe(struct pci_dev *pdev,
   } else if (boot_cpu_data.x86 == 0x1a) {
     switch (boot_cpu_data.x86_model) {
 
-    case 0x20 ... 0x24: /* Zen5 APU – Strix Point / Strix Halo */
+    case 0x20 ... 0x24: /* Zen5 APU -- Strix Point / Strix Halo */
       data->zen_gen = ZEN_GEN_5;
+      presumed_svi = SVI_VER_3;
       data->is_apu = true;
       data->amps_visible = true;
       data->svi_core_addr = F1AH_M20H_SVI3_TEL_PLANE0;
       data->svi_soc_addr = F1AH_M20H_SVI3_TEL_PLANE1;
+      data->smu_float_power = true;
       dev_info(dev, "Zen5 Strix Point APU (SVI3)\n");
       break;
 
-    case 0x44: /* Zen5 desktop – Granite Ridge (Ryzen 9000) */
+    case 0x44: /* Zen5 desktop -- Granite Ridge Ryzen 9000 (SVI3) */
       data->zen_gen = ZEN_GEN_5;
+      presumed_svi = SVI_VER_3;
       data->amps_visible = true;
       data->svi_core_addr = F1AH_M44H_SVI3_TEL_PLANE0;
       data->svi_soc_addr = F1AH_M44H_SVI3_TEL_PLANE1;
+      data->smu_float_power = true;
       ccd_check = 2;
       dev_info(dev, "Zen5 Granite Ridge desktop (SVI3)\n");
       break;
 
     default:
-      dev_warn(dev, "Unknown 1Ah model 0x%02x – using Zen5 defaults\n",
+      dev_warn(dev, "Unknown 1Ah model 0x%02x -- Zen5 defaults\n",
                boot_cpu_data.x86_model);
       data->zen_gen = ZEN_GEN_5;
+      presumed_svi = SVI_VER_3;
       data->svi_core_addr = F1AH_M20H_SVI3_TEL_PLANE0;
       data->svi_soc_addr = F1AH_M20H_SVI3_TEL_PLANE1;
+      data->smu_float_power = true;
       break;
     }
 
   } else {
-    dev_warn(dev, "Unknown CPU family 0x%02x – using Zen1 defaults\n",
+    dev_warn(dev, "Unknown CPU family 0x%02x -- Zen1 defaults\n",
              boot_cpu_data.x86);
     data->svi_core_addr = F17H_M01H_SVI_TEL_PLANE0;
     data->svi_soc_addr = F17H_M01H_SVI_TEL_PLANE1;
   }
 
-  /* Detect which CCDs are actually present (non-zero temperature) */
+  /* ---- SVI protocol auto-detect --------------------------------------- */
+  data->svi_ver = detect_svi_version(data, presumed_svi);
+
+  /* ---- CCD detection -------------------------------------------------- */
   for (i = 0; i < ccd_check; i++) {
-    data->read_amdsmn_addr(pdev, data->node_id, F17H_M70H_CCD_TEMP(i), &val);
-    if ((val & 0xfff) > 0)
+    data->read_amdsmn_addr(pdev, data->node_id, ZEN_CCD_TEMP(i), &val);
+    if ((val & ZEN_CCD_TEMP_VALID_MASK) > 0)
       data->ccd_visible[i] = true;
   }
 
-  /* Apply per-SKU Tctl offset */
+  /* ---- Tctl offset ---------------------------------------------------- */
   for (i = 0; i < ARRAY_SIZE(tctl_offset_table); i++) {
     const struct tctl_offset *e = &tctl_offset_table[i];
 
@@ -900,45 +1205,57 @@ static int zenpower_probe(struct pci_dev *pdev,
     }
   }
 
+  /* ---- SMU power register usability ----------------------------------- */
+  /*
+   * Only expose power3..5 when the SMU register returns a non-sentinel,
+   * physically plausible value.  Hides the channels gracefully on chips
+   * or firmware versions that leave the scratch space uninitialised.
+   */
+  data->ppt_visible = smu_reg_is_usable(data, data->smu_ppt_addr);
+  data->tdc_visible =
+      smu_reg_is_usable(data, data->smu_tdc_addr) && data->svi_core_addr != 0;
+  data->edc_visible =
+      smu_reg_is_usable(data, data->smu_edc_addr) && data->svi_core_addr != 0;
+
+  /* ---- Register with hwmon -------------------------------------------- */
   hwmon_dev = devm_hwmon_device_register_with_info(
       dev, "zenpower", data, &zenpower_chip_info, zenpower_groups);
 
   return PTR_ERR_OR_ZERO(hwmon_dev);
 }
 
-/* ── PCI device table ────────────────────────────────────────────────────── */
+/* ---- PCI ID table -------------------------------------------------------- */
 
 static const struct pci_device_id zenpower_id_table[] = {
     /* Family 17h – Zen / Zen+ / Zen2 */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_DF_F3)}, /* Zen SP3/Naples      */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_M10H_DF_F3)}, /* Zen+ Raven Ridge */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_DF_F3)}, /* Zen   SP3/Naples     */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_17H_M20H_DF_F3)}, /* Zen Raven (alt DID) */
+                 PCI_DEVICE_ID_AMD_17H_M10H_DF_F3)}, /* Zen+  Raven Ridge    */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_17H_M30H_DF_F3)}, /* Zen2 Castle Peak TR */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_M60H_DF_F3)}, /* Zen2 Renoir APU */
+                 PCI_DEVICE_ID_AMD_17H_M20H_DF_F3)}, /* Zen   Raven (alt)    */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_17H_M68H_DF_F3)}, /* Zen2 Lucienne APU   */
+                 PCI_DEVICE_ID_AMD_17H_M30H_DF_F3)}, /* Zen2  Castle Peak TR */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_M60H_DF_F3)}, /* Zen2  Renoir APU */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_17H_M70H_DF_F3)}, /* Zen2 Matisse Ryzen  */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_M90H_DF_F3)}, /* Zen2 Van Gogh */
-
+                 PCI_DEVICE_ID_AMD_17H_M68H_DF_F3)}, /* Zen2  Lucienne APU   */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_M70H_DF_F3)}, /* Zen2  Matisse */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_17H_M90H_DF_F3)}, /* Zen2  Van Gogh */
     /* Family 19h – Zen3 / Zen3+ / Zen4 */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_DF_F3)}, /* Zen3 Milan EPYC     */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M10H_DF_F3)}, /* Zen4 Genoa EPYC */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_DF_F3)}, /* Zen3  Milan EPYC     */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M10H_DF_F3)}, /* Zen4  Genoa EPYC */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M21H_DF_F3)}, /* Zen3  Vermeer */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_19H_M21H_DF_F3)}, /* Zen3 Vermeer Ryzen  */
+                 PCI_DEVICE_ID_AMD_19H_M40H_DF_F3)}, /* Zen3+ Rembrandt APU  */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_19H_M40H_DF_F3)}, /* Zen3+ Rembrandt APU */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M50H_DF_F3)}, /* Zen3 Cezanne APU */
+                 PCI_DEVICE_ID_AMD_19H_M50H_DF_F3)}, /* Zen3  Cezanne APU    */
+    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M61H_DF_F3)}, /* Zen4  Raphael */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_19H_M61H_DF_F3)}, /* Zen4 Raphael Ryzen  */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_19H_M70H_DF_F3)}, /* Zen4 Phoenix APU */
-
+                 PCI_DEVICE_ID_AMD_19H_M70H_DF_F3)}, /* Zen4  Phoenix APU    */
     /* Family 1Ah – Zen5 */
-    {PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_1AH_M20H_DF_F3)}, /* Zen5 Strix Point */
     {PCI_VDEVICE(AMD,
-                 PCI_DEVICE_ID_AMD_1AH_M44H_DF_F3)}, /* Zen5 Granite Ridge  */
+                 PCI_DEVICE_ID_AMD_1AH_M20H_DF_F3)}, /* Zen5  Strix Point    */
+    {PCI_VDEVICE(AMD,
+                 PCI_DEVICE_ID_AMD_1AH_M44H_DF_F3)}, /* Zen5  Granite Ridge  */
     {}};
 MODULE_DEVICE_TABLE(pci, zenpower_id_table);
 
