@@ -48,6 +48,7 @@
  * a sentinel or implausible value.
  */
 
+#include <linux/bitops.h>
 #include <linux/hwmon.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -192,7 +193,8 @@ MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
 
 /* CCD temperature registers */
 #define ZEN_CCD_TEMP(x) (0x00059954 + ((x) * 4))
-#define ZEN_CCD_TEMP_VALID_MASK 0xfff
+#define ZEN_CCD_TEMP_VALID BIT(11)
+#define ZEN_CCD_TEMP_MASK 0x7ff
 
 /*
  * SMU scratch / metrics registers (community-derived, best-effort).
@@ -651,11 +653,11 @@ static int get_ccd_temp(struct zenpower_data *data, u32 addr, long *val) {
     return err;
 
   /*
-   * Signed arithmetic: (raw * 125) - 305000 millidegrees C.
-   * Return type must be int so that sub-ambient readings (raw < 2440)
-   * are negative rather than wrapping to ~4 GB on unsigned subtraction.
+   * Linux k10temp-compatible decode:
+   * bits[10:0] hold the temperature in 0.125 C units with a -49 C offset;
+   * bit 11 is a validity flag and must not be part of the value.
    */
-  *val = (int)((regval & ZEN_CCD_TEMP_VALID_MASK) * 125u) - 305000;
+  *val = (long)(regval & ZEN_CCD_TEMP_MASK) * 125L - 49000L;
   return 0;
 }
 
@@ -1370,7 +1372,7 @@ static int zenpower_probe(struct pci_dev *pdev,
   /* ---- CCD detection -------------------------------------------------- */
   for (i = 0; i < ccd_check; i++) {
     if (!data->read_amdsmn_addr(pdev, data->node_id, ZEN_CCD_TEMP(i), &val) &&
-        (val & ZEN_CCD_TEMP_VALID_MASK) > 0)
+        (val & ZEN_CCD_TEMP_VALID))
       data->ccd_visible[i] = true;
   }
 
