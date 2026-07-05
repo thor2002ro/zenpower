@@ -327,6 +327,7 @@ struct zenpower_data {
   u64 rapl_accum_energy[RAPL_CHANNEL_COUNT];
   u64 rapl_prev_energy[RAPL_CHANNEL_COUNT];
   u64 rapl_prev_raw_energy[RAPL_CHANNEL_COUNT];
+  ktime_t rapl_last_accum_time[RAPL_CHANNEL_COUNT];
   ktime_t rapl_prev_time[RAPL_CHANNEL_COUNT];
   bool rapl_available[RAPL_CHANNEL_COUNT];
   int rapl_cpu;
@@ -765,9 +766,27 @@ static u32 zenpower_rapl_accum_interval_ms(u32 energy_unit) {
   return (u32)max_t(u64, ms, 1);
 }
 
+static bool zenpower_rapl_accum_deadline_missed(struct zenpower_data *data,
+                                                int channel, ktime_t now) {
+  s64 elapsed_ms;
+  u64 wrap_guard_ms;
+
+  if (data->rapl_counter_64bit || !data->rapl_accum_interval_ms)
+    return false;
+
+  elapsed_ms =
+      ktime_to_ms(ktime_sub(now, data->rapl_last_accum_time[channel]));
+  if (elapsed_ms <= 0)
+    return false;
+
+  wrap_guard_ms = (u64)data->rapl_accum_interval_ms * 2;
+  return (u64)elapsed_ms >= wrap_guard_ms;
+}
+
 static int zenpower_rapl_accumulate_channel(struct zenpower_data *data,
                                             int channel, u64 *energy) {
   u64 energy_now;
+  ktime_t now;
   int err;
 
   err = zenpower_rapl_read_msr(data, MSR_AMD_PKG_ENERGY_STATUS, &energy_now);
@@ -782,10 +801,25 @@ static int zenpower_rapl_accumulate_channel(struct zenpower_data *data,
     return 0;
   }
 
+  now = ktime_get();
+  if (zenpower_rapl_accum_deadline_missed(data, channel, now)) {
+    /*
+     * The 32-bit counter may have wrapped more than once while accumulation was
+     * stalled.  Drop the unknowable delta, re-baseline the raw counter, and make
+     * the next foreground read start a fresh dEnergy/dTime window.
+     */
+    data->rapl_prev_raw_energy[channel] = energy_now;
+    data->rapl_last_accum_time[channel] = now;
+    data->rapl_prev_energy[channel] = data->rapl_accum_energy[channel];
+    data->rapl_prev_time[channel] = now;
+    return -EAGAIN;
+  }
+
   data->rapl_accum_energy[channel] +=
       zenpower_rapl_counter_delta(data, energy_now,
                                   data->rapl_prev_raw_energy[channel]);
   data->rapl_prev_raw_energy[channel] = energy_now;
+  data->rapl_last_accum_time[channel] = now;
 
   if (energy)
     *energy = data->rapl_accum_energy[channel];
@@ -845,6 +879,7 @@ static int zenpower_rapl_init(struct zenpower_data *data, struct device *dev) {
   data->rapl_available[RAPL_CHANNEL_PACKAGE] = true;
 
   now = ktime_get();
+  data->rapl_last_accum_time[RAPL_CHANNEL_PACKAGE] = now;
   data->rapl_prev_time[RAPL_CHANNEL_PACKAGE] = now;
   data->rapl_initialized = true;
 
@@ -1735,14 +1770,18 @@ static int zenpower_probe(struct pci_dev *pdev,
       data->svi_core_addr != 0;
 
   /*
-   * AMD RAPL energy MSRs exist on many Zen CPUs, not only Zen5. Probe the
-   * backend and expose the channels only if the MSRs are actually readable.
+   * AMD RAPL package energy is socket-scoped and readable from any core in the
+   * package.  On multi-node packages, expose it only from the first DF node so
+   * userspace does not see duplicate package-power channels.
    */
-  {
+  if (node_of_cpu == 0) {
     int rapl_err = zenpower_rapl_init(data, dev);
 
     if (rapl_err)
       dev_dbg(dev, "RAPL unavailable (%d)\n", rapl_err);
+  } else {
+    dev_dbg(dev, "RAPL skipped on package node %u\n",
+            (unsigned int)node_of_cpu);
   }
 
   /* ---- Register with hwmon -------------------------------------------- */
