@@ -42,6 +42,8 @@
  *   power3  Package PPT      (SMU silicon limit, uW, when readable)
  *   power4  TDC x Vcore      (sustained current proxy, uW, informational)
  *   power5  EDC x Vcore      (peak current proxy, uW, informational)
+ *   power6  RAPL package     (MSR energy counter average, uW, when available)
+ *   power7  RAPL core        (MSR energy counter average, uW, when available)
  *
  * NOTE: power3-5 use SMU scratch registers whose layout is community-
  * derived.  They hide themselves at probe time if the register returns
@@ -49,10 +51,15 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/cpu.h>
 #include <linux/hwmon.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/topology.h>
 #include <linux/version.h>
+#include <asm/msr.h>
 
 /*
  * Linux 6.16 reorganised the AMD northbridge header from asm/amd_nb.h into
@@ -65,10 +72,17 @@
 #include <asm/amd_nb.h>
 #endif
 
+/* Kernel 6.16+ renamed rdmsrl_safe_on_cpu() to rdmsrq_safe_on_cpu(). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define zenpower_rdmsrq_safe_on_cpu rdmsrq_safe_on_cpu
+#else
+#define zenpower_rdmsrq_safe_on_cpu rdmsrl_safe_on_cpu
+#endif
+
 MODULE_DESCRIPTION("AMD ZEN family CPU Sensors Driver");
 MODULE_AUTHOR("thor2002ro");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.4.0");
+MODULE_VERSION("0.6.0");
 
 /* ---- Module parameters -------------------------------------------------- */
 
@@ -223,6 +237,18 @@ MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
 #define SMU_CURRENT_LIMIT_MASK 0x7ff
 #define SMU_CURRENT_LIMIT_MAX_MA 500000
 
+/* AMD RAPL MSRs */
+#define MSR_AMD_RAPL_POWER_UNIT 0xc0010299
+#define MSR_AMD_PP0_ENERGY_STATUS 0xc001029a
+#define MSR_AMD_PKG_ENERGY_STATUS 0xc001029b
+
+#define RAPL_ENERGY_UNIT_MASK 0x1f00
+#define RAPL_ENERGY_UNIT_SHIFT 8
+#define RAPL_ENERGY_STATUS_MASK 0xffffffffULL
+#define RAPL_CHANNEL_PACKAGE 0
+#define RAPL_CHANNEL_CORE 1
+#define RAPL_CHANNEL_COUNT 2
+
 /*
  * Plausibility window for SVI voltage auto-detection.
  * Any decoded voltage outside this range (mV) means the register layout
@@ -291,6 +317,14 @@ struct zenpower_data {
    * false => SMU register holds integer milliwatts    (Zen2/3)
    */
   bool smu_float_power;
+
+  /* RAPL power tracking: [0]=package, [1]=core */
+  u64 rapl_prev_energy[RAPL_CHANNEL_COUNT];
+  ktime_t rapl_prev_time[RAPL_CHANNEL_COUNT];
+  bool rapl_available[RAPL_CHANNEL_COUNT];
+  int rapl_cpu;
+  u32 rapl_energy_unit; /* ESU exponent from MSR_AMD_RAPL_POWER_UNIT */
+  bool rapl_initialized;
 };
 
 /* ---- Tctl offsets -------------------------------------------------------- */
@@ -624,6 +658,135 @@ static bool smu_current_limit_is_usable(struct zenpower_data *data, u32 addr) {
   return (ma > 0 && ma <= SMU_CURRENT_LIMIT_MAX_MA);
 }
 
+/* ---- RAPL power backend -------------------------------------------------- */
+
+static int zenpower_rapl_pick_cpu(struct zenpower_data *data) {
+  int cpu;
+
+  for_each_online_cpu(cpu) {
+    if (topology_physical_package_id(cpu) == data->cpu_id) {
+      data->rapl_cpu = cpu;
+      return 0;
+    }
+  }
+
+  if (data->cpu_id)
+    return -ENODEV;
+
+  cpu = cpumask_first(cpu_online_mask);
+  if (cpu >= nr_cpu_ids)
+    return -ENODEV;
+
+  data->rapl_cpu = cpu;
+  return 0;
+}
+
+static int zenpower_rapl_read_msr(struct zenpower_data *data, u32 msr,
+                                  u64 *val) {
+  int err;
+
+  if (data->rapl_cpu < 0 || !cpu_online(data->rapl_cpu)) {
+    err = zenpower_rapl_pick_cpu(data);
+    if (err)
+      return err;
+  }
+
+  return zenpower_rdmsrq_safe_on_cpu(data->rapl_cpu, msr, val);
+}
+
+static int zenpower_rapl_init(struct zenpower_data *data, struct device *dev) {
+  ktime_t now;
+  u32 energy_unit;
+  u64 val;
+  int err;
+
+  err = zenpower_rapl_pick_cpu(data);
+  if (err)
+    return err;
+
+  err = zenpower_rapl_read_msr(data, MSR_AMD_RAPL_POWER_UNIT, &val);
+  if (err)
+    return err;
+
+  energy_unit = (val & RAPL_ENERGY_UNIT_MASK) >> RAPL_ENERGY_UNIT_SHIFT;
+  data->rapl_energy_unit = energy_unit;
+
+  err = zenpower_rapl_read_msr(data, MSR_AMD_PKG_ENERGY_STATUS, &val);
+  if (err)
+    return err;
+  data->rapl_prev_energy[RAPL_CHANNEL_PACKAGE] =
+      val & RAPL_ENERGY_STATUS_MASK;
+  data->rapl_available[RAPL_CHANNEL_PACKAGE] = true;
+
+  err = zenpower_rapl_read_msr(data, MSR_AMD_PP0_ENERGY_STATUS, &val);
+  if (err) {
+    data->rapl_available[RAPL_CHANNEL_CORE] = false;
+    dev_dbg(dev, "RAPL core energy MSR unavailable (%d)\n", err);
+  } else {
+    data->rapl_prev_energy[RAPL_CHANNEL_CORE] =
+        val & RAPL_ENERGY_STATUS_MASK;
+    data->rapl_available[RAPL_CHANNEL_CORE] = true;
+  }
+
+  now = ktime_get();
+  data->rapl_prev_time[RAPL_CHANNEL_PACKAGE] = now;
+  data->rapl_prev_time[RAPL_CHANNEL_CORE] = now;
+  data->rapl_initialized = true;
+
+  return 0;
+}
+
+static int zenpower_rapl_read_power(struct zenpower_data *data, int channel,
+                                    long *val) {
+  ktime_t now, delta;
+  u64 energy_now;
+  u64 energy_delta;
+  u64 divisor;
+  u64 uw;
+  u32 msr;
+  s64 delta_ms;
+  int err;
+
+  if (channel < 0 || channel >= RAPL_CHANNEL_COUNT ||
+      !data->rapl_initialized || !data->rapl_available[channel])
+    return -EOPNOTSUPP;
+
+  msr = (channel == RAPL_CHANNEL_PACKAGE) ? MSR_AMD_PKG_ENERGY_STATUS
+                                          : MSR_AMD_PP0_ENERGY_STATUS;
+
+  err = zenpower_rapl_read_msr(data, msr, &energy_now);
+  if (err)
+    return err;
+  energy_now &= RAPL_ENERGY_STATUS_MASK;
+
+  now = ktime_get();
+  delta = ktime_sub(now, data->rapl_prev_time[channel]);
+  delta_ms = ktime_to_ms(delta);
+  if (delta_ms <= 0)
+    return -EAGAIN;
+
+  if (energy_now >= data->rapl_prev_energy[channel])
+    energy_delta = energy_now - data->rapl_prev_energy[channel];
+  else
+    energy_delta = (RAPL_ENERGY_STATUS_MASK + 1 -
+                    data->rapl_prev_energy[channel]) +
+                   energy_now;
+
+  if ((u64)delta_ms > (~0ULL >> data->rapl_energy_unit))
+    return -ERANGE;
+  divisor = (u64)delta_ms << data->rapl_energy_unit;
+  if (!divisor)
+    return -ERANGE;
+
+  uw = div64_u64(energy_delta * 1000000000ULL, divisor);
+  *val = (long)min_t(u64, uw, (u64)LONG_MAX);
+
+  data->rapl_prev_energy[channel] = energy_now;
+  data->rapl_prev_time[channel] = now;
+
+  return 0;
+}
+
 /* ---- Temperature reading ------------------------------------------------- */
 
 static int get_ctl_temp(struct zenpower_data *data, long *val) {
@@ -704,6 +867,10 @@ static umode_t zenpower_is_visible(const void *rdata,
     if (channel == 3 && !data->tdc_visible)
       return 0;
     if (channel == 4 && !data->edc_visible)
+      return 0;
+    if (channel == 5 && !data->rapl_available[RAPL_CHANNEL_PACKAGE])
+      return 0;
+    if (channel == 6 && !data->rapl_available[RAPL_CHANNEL_CORE])
       return 0;
     break;
 
@@ -896,6 +1063,25 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
       break;
     }
 
+    /*
+     * ch5 / ch6: RAPL package/core power in uW.
+     *
+     * RAPL reports monotonically increasing energy counters; power is the
+     * average rate between this read and the previous read for the channel.
+     * This provides an MSR-backed package-power fallback/comparison path
+     * when the CPU exposes AMD RAPL counters.
+     */
+    case 5:
+      err = zenpower_rapl_read_power(data, RAPL_CHANNEL_PACKAGE, val);
+      if (err)
+        return err;
+      break;
+    case 6:
+      err = zenpower_rapl_read_power(data, RAPL_CHANNEL_CORE, val);
+      if (err)
+        return err;
+      break;
+
     default:
       return -EOPNOTSUPP;
     }
@@ -938,14 +1124,18 @@ static const char *const zenpower_curr_label[][2] = {
  *   [2] Package PPT          (ch2)
  *   [3] TDC x Vcore proxy    (ch3)
  *   [4] EDC x Vcore proxy    (ch4)
+ *   [5] RAPL package power   (ch5)
+ *   [6] RAPL core power      (ch6)
  */
-static const char *const zenpower_power_label[][5] = {
+static const char *const zenpower_power_label[][7] = {
     {
         "SVI_P_Core",
         "SVI_P_SoC",
         "PPT_Package",
         "TDC_Core_proxy",
         "EDC_Core_proxy",
+        "RAPL_P_Package",
+        "RAPL_P_Core",
     },
     {
         "cpu0 SVI_P_Core",
@@ -953,6 +1143,8 @@ static const char *const zenpower_power_label[][5] = {
         "cpu0 PPT_Package",
         "cpu0 TDC_Core_proxy",
         "cpu0 EDC_Core_proxy",
+        "cpu0 RAPL_P_Package",
+        "cpu0 RAPL_P_Core",
     },
     {
         "cpu1 SVI_P_Core",
@@ -960,6 +1152,8 @@ static const char *const zenpower_power_label[][5] = {
         "cpu1 PPT_Package",
         "cpu1 TDC_Core_proxy",
         "cpu1 EDC_Core_proxy",
+        "cpu1 RAPL_P_Package",
+        "cpu1 RAPL_P_Core",
     },
 };
 
@@ -1026,6 +1220,11 @@ static ssize_t debug_data_show(struct device *dev,
   DBGPR("PPT_VIS:    %d\n", data->ppt_visible);
   DBGPR("TDC_VIS:    %d\n", data->tdc_visible);
   DBGPR("EDC_VIS:    %d\n", data->edc_visible);
+  DBGPR("RAPL_INIT:  %d\n", data->rapl_initialized);
+  DBGPR("RAPL_CPU:   %d\n", data->rapl_cpu);
+  DBGPR("RAPL_PKG:   %d\n", data->rapl_available[RAPL_CHANNEL_PACKAGE]);
+  DBGPR("RAPL_CORE:  %d\n", data->rapl_available[RAPL_CHANNEL_CORE]);
+  DBGPR("RAPL_ESU:   %u\n", data->rapl_energy_unit);
   DBGPR("FLOAT_PWR:  %d\n", data->smu_float_power);
   DBGPR("SVI_CORE:   %08x\n", data->svi_core_addr);
   DBGPR("SVI_SOC:    %08x\n", data->svi_soc_addr);
@@ -1076,7 +1275,9 @@ static const struct hwmon_channel_info *zenpower_info[] = {
                        HWMON_P_INPUT | HWMON_P_LABEL,  /* SoC  rail power  */
                        HWMON_P_INPUT | HWMON_P_LABEL,  /* PPT package      */
                        HWMON_P_INPUT | HWMON_P_LABEL,  /* TDC proxy        */
-                       HWMON_P_INPUT | HWMON_P_LABEL), /* EDC proxy        */
+                       HWMON_P_INPUT | HWMON_P_LABEL,  /* EDC proxy        */
+                       HWMON_P_INPUT | HWMON_P_LABEL,  /* RAPL package     */
+                       HWMON_P_INPUT | HWMON_P_LABEL), /* RAPL core        */
 
     NULL};
 
@@ -1127,6 +1328,9 @@ static int zenpower_probe(struct pci_dev *pdev,
   data->tdc_visible = false;
   data->edc_visible = false;
   data->smu_float_power = false;
+  data->rapl_initialized = false;
+  data->rapl_cpu = -1;
+  data->rapl_energy_unit = 0;
   data->temp_offset = 0;
   data->node_id = 0;
   for (i = 0; i < MAX_CCD; i++)
@@ -1403,6 +1607,17 @@ static int zenpower_probe(struct pci_dev *pdev,
   data->edc_visible =
       smu_current_limit_is_usable(data, data->smu_edc_addr) &&
       data->svi_core_addr != 0;
+
+  /*
+   * AMD RAPL energy MSRs exist on many Zen CPUs, not only Zen5. Probe the
+   * backend and expose the channels only if the MSRs are actually readable.
+   */
+  {
+    int rapl_err = zenpower_rapl_init(data, dev);
+
+    if (rapl_err)
+      dev_dbg(dev, "RAPL unavailable (%d)\n", rapl_err);
+  }
 
   /* ---- Register with hwmon -------------------------------------------- */
   hwmon_dev = devm_hwmon_device_register_with_info(
