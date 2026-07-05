@@ -197,8 +197,10 @@ MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
 /*
  * SMU scratch / metrics registers (community-derived, best-effort).
  *
- * Format on Zen2/3: 32-bit integer, units = milliwatts.
- * Format on Zen4/5: 32-bit IEEE-754 single-precision float, units = watts.
+ * PPT format on Zen2/3: 32-bit integer, units = milliwatts.
+ * PPT format on Zen4/5: 32-bit IEEE-754 single-precision float, units = watts.
+ *
+ * TDC/EDC limit format: unsigned 8.3 fixed-point amps in bits[10:0].
  *
  * All values returned to hwmon in microwatts.
  */
@@ -215,6 +217,9 @@ MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
 
 #define SMU_REG_SENTINEL_FF 0xFFFFFFFF
 #define SMU_REG_SENTINEL_00 0x00000000
+
+#define SMU_CURRENT_LIMIT_MASK 0x7ff
+#define SMU_CURRENT_LIMIT_MAX_MA 500000
 
 /*
  * Plausibility window for SVI voltage auto-detection.
@@ -523,6 +528,10 @@ static int read_smu_power_uw(struct zenpower_data *data, u32 addr, long *val) {
   return 0;
 }
 
+static u32 smu_current_limit_raw_to_ma(u32 raw) {
+  return ((raw & SMU_CURRENT_LIMIT_MASK) * 1000u) / 8u;
+}
+
 /* ---- SVI protocol auto-detection ---------------------------------------- */
 /*
  * Strategy:
@@ -583,7 +592,7 @@ static enum svi_version detect_svi_version(struct zenpower_data *data,
  * Returns true if the SMU register at 'addr' returns a non-sentinel value
  * that decodes to a physically plausible power in the range 1 mW..10 kW.
  */
-static bool smu_reg_is_usable(struct zenpower_data *data, u32 addr) {
+static bool smu_power_reg_is_usable(struct zenpower_data *data, u32 addr) {
   long uw;
   int err;
 
@@ -594,6 +603,23 @@ static bool smu_reg_is_usable(struct zenpower_data *data, u32 addr) {
     return false;
   /* Accept 1 uW to 10 kW */
   return (uw > 0 && uw <= 10000LL * 1000000LL);
+}
+
+static bool smu_current_limit_is_usable(struct zenpower_data *data, u32 addr) {
+  u32 raw;
+  u32 ma;
+  int err;
+
+  if (!addr)
+    return false;
+  err = data->read_amdsmn_addr(data->pdev, data->node_id, addr, &raw);
+  if (err)
+    return false;
+  if (raw == SMU_REG_SENTINEL_FF || raw == SMU_REG_SENTINEL_00)
+    return false;
+
+  ma = smu_current_limit_raw_to_ma(raw);
+  return (ma > 0 && ma <= SMU_CURRENT_LIMIT_MAX_MA);
 }
 
 /* ---- Temperature reading ------------------------------------------------- */
@@ -818,7 +844,7 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
      * ch3: TDC proxy -- sustained current limit x current Vcore.
      *
      * The TDC register holds the sustained current ceiling in amps
-     * (8.3 fixed-point format: bits[10:3] = integer amps).
+     * (unsigned 8.3 fixed-point format in bits[10:0]).
      * We multiply by the live Vcore reading to produce a power proxy.
      * This is informational -- it represents headroom, not consumption.
      */
@@ -833,7 +859,10 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
                                    data->svi_core_addr, &vcore_plane);
       if (err)
         return err;
-      tdc_ma = ((tdc_raw >> 3) & 0xff) * 1000;
+      tdc_ma = (tdc_raw == SMU_REG_SENTINEL_FF ||
+                tdc_raw == SMU_REG_SENTINEL_00)
+                   ? 0
+                   : smu_current_limit_raw_to_ma(tdc_raw);
       mv = plane_to_vcc_mv(vcore_plane, data);
       *val = safe_power_uw(tdc_ma, mv);
       break;
@@ -856,7 +885,10 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
                                    data->svi_core_addr, &vcore_plane);
       if (err)
         return err;
-      edc_ma = ((edc_raw >> 3) & 0xff) * 1000;
+      edc_ma = (edc_raw == SMU_REG_SENTINEL_FF ||
+                edc_raw == SMU_REG_SENTINEL_00)
+                   ? 0
+                   : smu_current_limit_raw_to_ma(edc_raw);
       mv = plane_to_vcc_mv(vcore_plane, data);
       *val = safe_power_uw(edc_ma, mv);
       break;
@@ -1355,17 +1387,20 @@ static int zenpower_probe(struct pci_dev *pdev,
     }
   }
 
-  /* ---- SMU power register usability ----------------------------------- */
+  /* ---- SMU register usability ----------------------------------------- */
   /*
-   * Only expose power3..5 when the SMU register returns a non-sentinel,
-   * physically plausible value.  Hides the channels gracefully on chips
-   * or firmware versions that leave the scratch space uninitialised.
+   * Only expose power3..5 when the backing SMU register returns a
+   * non-sentinel, physically plausible value in the expected units.  Hides the
+   * channels gracefully on chips or firmware versions that leave the scratch
+   * space uninitialised.
    */
-  data->ppt_visible = smu_reg_is_usable(data, data->smu_ppt_addr);
+  data->ppt_visible = smu_power_reg_is_usable(data, data->smu_ppt_addr);
   data->tdc_visible =
-      smu_reg_is_usable(data, data->smu_tdc_addr) && data->svi_core_addr != 0;
+      smu_current_limit_is_usable(data, data->smu_tdc_addr) &&
+      data->svi_core_addr != 0;
   data->edc_visible =
-      smu_reg_is_usable(data, data->smu_edc_addr) && data->svi_core_addr != 0;
+      smu_current_limit_is_usable(data, data->smu_edc_addr) &&
+      data->svi_core_addr != 0;
 
   /* ---- Register with hwmon -------------------------------------------- */
   hwmon_dev = devm_hwmon_device_register_with_info(
