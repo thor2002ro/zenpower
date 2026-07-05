@@ -477,15 +477,14 @@ static long safe_power_uw(u32 ma, u32 mv) {
  *
  * float layout: [31] sign | [30:23] biased exponent | [22:0] mantissa
  *
- * exp upper bound of 23: 2^23 W = ~8 MW, safely above any realistic CPU power.
- * This also allows the left-shift (exp >= 23) path to be reachable; the
- * previous bound of 20 made that branch dead code.
+ * exp upper bound of 23: multi-MW range, safely above any realistic CPU power.
+ * Multiply by 1,000,000 before shifting so fractional watts are preserved.
  */
 static long smu_float_to_uw(u32 raw) {
   u32 sign = (raw >> 31) & 1;
   s32 exp = (s32)((raw >> 23) & 0xff) - 127;
   u32 mantissa = (raw & 0x7fffff) | 0x800000; /* implicit leading 1 */
-  u64 watts_sc; /* mantissa scaled by 2^(exp-23), i.e. watts * 2^23 */
+  u64 uw_sc; /* mantissa scaled to microwatts before binary exponent shift */
 
   /* Reject: negative, zero, infinity/NaN (biased exp = 0xff) */
   if (sign || raw == 0 || ((raw >> 23) & 0xff) == 0xff)
@@ -494,13 +493,14 @@ static long smu_float_to_uw(u32 raw) {
   if (exp < -10 || exp > 23)
     return 0;
 
-  if (exp >= 23)
-    watts_sc = (u64)mantissa << (u32)(exp - 23);
-  else
-    watts_sc = (u64)mantissa >> (u32)(23 - exp);
+  uw_sc = (u64)mantissa * 1000000ULL;
 
-  /* watts -> µW: multiply by 1,000,000.  watts_sc <= 2^23 so no overflow. */
-  return (long)min_t(u64, watts_sc * 1000000ULL, (u64)LONG_MAX);
+  if (exp >= 23)
+    uw_sc <<= (u32)(exp - 23);
+  else
+    uw_sc >>= (u32)(23 - exp);
+
+  return (long)min_t(u64, uw_sc, (u64)LONG_MAX);
 }
 
 static int read_smu_power_uw(struct zenpower_data *data, u32 addr, long *val) {
