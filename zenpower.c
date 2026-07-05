@@ -252,8 +252,8 @@ enum svi_version {
 
 struct zenpower_data {
   struct pci_dev *pdev;
-  void (*read_amdsmn_addr)(struct pci_dev *pdev, u16 node_id, u32 address,
-                           u32 *regval);
+  int (*read_amdsmn_addr)(struct pci_dev *pdev, u16 node_id, u32 address,
+                          u32 *regval);
 
   u32 svi_core_addr;
   u32 svi_soc_addr;
@@ -329,18 +329,40 @@ static u16 amd_pci_dev_to_node_id(struct pci_dev *pdev) {
 
 /* ---- SMN access backends ------------------------------------------------- */
 
-static void kernel_smn_read(struct pci_dev *pdev, u16 node_id, u32 address,
-                            u32 *regval) {
-  amd_smn_read(node_id, address, regval);
+static int kernel_smn_read(struct pci_dev *pdev, u16 node_id, u32 address,
+                           u32 *regval) {
+  int err;
+
+  err = amd_smn_read(node_id, address, regval);
+  if (err)
+    *regval = 0;
+
+  return err;
 }
 
 /* Fallback: PCI index pair -- may be inaccurate on multi-die chips */
-static void nb_index_read(struct pci_dev *pdev, u16 node_id, u32 address,
-                          u32 *regval) {
+static int nb_index_read(struct pci_dev *pdev, u16 node_id, u32 address,
+                         u32 *regval) {
+  int err;
+
+  *regval = 0;
+
   mutex_lock(&nb_smu_ind_mutex);
-  pci_bus_write_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x60, address);
-  pci_bus_read_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x64, regval);
+  err = pci_bus_write_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x60, address);
+  if (!err)
+    err = pci_bus_read_config_dword(pdev->bus, PCI_DEVFN(0, 0), 0x64,
+                                    regval);
   mutex_unlock(&nb_smu_ind_mutex);
+
+  if (err)
+    return -EIO;
+
+  if (PCI_POSSIBLE_ERROR(*regval)) {
+    *regval = 0;
+    return -ENODEV;
+  }
+
+  return 0;
 }
 
 /* ---- SVI2 decode --------------------------------------------------------- */
@@ -476,22 +498,29 @@ static long smu_float_to_uw(u32 raw) {
   return (long)min_t(u64, watts_sc * 1000000ULL, (u64)LONG_MAX);
 }
 
-static long read_smu_power_uw(struct zenpower_data *data, u32 addr) {
+static int read_smu_power_uw(struct zenpower_data *data, u32 addr, long *val) {
   u32 raw;
+  int err;
+
+  *val = 0;
 
   if (!addr)
-    return 0;
+    return -ENODEV;
 
-  data->read_amdsmn_addr(data->pdev, data->node_id, addr, &raw);
+  err = data->read_amdsmn_addr(data->pdev, data->node_id, addr, &raw);
+  if (err)
+    return err;
 
   if (raw == SMU_REG_SENTINEL_FF || raw == SMU_REG_SENTINEL_00)
     return 0;
 
   if (data->smu_float_power)
-    return smu_float_to_uw(raw);
+    *val = smu_float_to_uw(raw);
+  else
+    /* Integer milliwatts -> µW, clamped */
+    *val = (long)min_t(u64, (u64)raw * 1000ULL, (u64)LONG_MAX);
 
-  /* Integer milliwatts -> µW, clamped */
-  return (long)min_t(u64, (u64)raw * 1000ULL, (u64)LONG_MAX);
+  return 0;
 }
 
 /* ---- SVI protocol auto-detection ---------------------------------------- */
@@ -523,8 +552,9 @@ static enum svi_version detect_svi_version(struct zenpower_data *data,
   if (!data->svi_core_addr)
     return presumed;
 
-  data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
-                         &plane);
+  if (data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
+                             &plane))
+    return presumed;
 
   /* Test presumed version */
   mv = (presumed == SVI_VER_3) ? svi3_to_vcc(plane) : svi2_to_vcc(plane);
@@ -555,38 +585,52 @@ static enum svi_version detect_svi_version(struct zenpower_data *data,
  */
 static bool smu_reg_is_usable(struct zenpower_data *data, u32 addr) {
   long uw;
+  int err;
 
   if (!addr)
     return false;
-  uw = read_smu_power_uw(data, addr);
+  err = read_smu_power_uw(data, addr, &uw);
+  if (err)
+    return false;
   /* Accept 1 uW to 10 kW */
   return (uw > 0 && uw <= 10000LL * 1000000LL);
 }
 
 /* ---- Temperature reading ------------------------------------------------- */
 
-static unsigned int get_ctl_temp(struct zenpower_data *data) {
+static int get_ctl_temp(struct zenpower_data *data, long *val) {
   u32 regval;
-  unsigned int temp;
+  long temp;
+  int err;
 
-  data->read_amdsmn_addr(data->pdev, data->node_id,
-                         F17H_M01H_REPORTED_TEMP_CTRL, &regval);
+  err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                               F17H_M01H_REPORTED_TEMP_CTRL, &regval);
+  if (err)
+    return err;
+
   temp = (regval >> 21) * 125;
   if (regval & F17H_TEMP_ADJUST_MASK)
     temp -= 49000;
-  return temp;
+
+  *val = temp;
+  return 0;
 }
 
-static int get_ccd_temp(struct zenpower_data *data, u32 addr) {
+static int get_ccd_temp(struct zenpower_data *data, u32 addr, long *val) {
   u32 regval;
+  int err;
 
-  data->read_amdsmn_addr(data->pdev, data->node_id, addr, &regval);
+  err = data->read_amdsmn_addr(data->pdev, data->node_id, addr, &regval);
+  if (err)
+    return err;
+
   /*
    * Signed arithmetic: (raw * 125) - 305000 millidegrees C.
    * Return type must be int so that sub-ambient readings (raw < 2440)
    * are negative rather than wrapping to ~4 GB on unsigned subtraction.
    */
-  return (int)((regval & ZEN_CCD_TEMP_VALID_MASK) * 125u) - 305000;
+  *val = (int)((regval & ZEN_CCD_TEMP_VALID_MASK) * 125u) - 305000;
+  return 0;
 }
 
 /* ---- hwmon visibility ---------------------------------------------------- */
@@ -648,6 +692,7 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
                          u32 attr, int channel, long *val) {
   struct zenpower_data *data = dev_get_drvdata(dev);
   u32 plane;
+  int err;
 
   switch (type) {
 
@@ -672,13 +717,20 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
 
     switch (channel) {
     case 0:
-      *val = get_ctl_temp(data) - data->temp_offset;
+      err = get_ctl_temp(data, val);
+      if (err)
+        return err;
+      *val -= data->temp_offset;
       break;
     case 1:
-      *val = get_ctl_temp(data);
+      err = get_ctl_temp(data, val);
+      if (err)
+        return err;
       break;
     case 2 ... 9:
-      *val = get_ccd_temp(data, ZEN_CCD_TEMP(channel - 2));
+      err = get_ccd_temp(data, ZEN_CCD_TEMP(channel - 2), val);
+      if (err)
+        return err;
       break;
     default:
       return -EOPNOTSUPP;
@@ -699,16 +751,18 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
 
     switch (channel) {
     case 0:
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
-                             &plane);
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->svi_core_addr, &plane);
       break;
     case 1:
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_soc_addr,
-                             &plane);
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->svi_soc_addr, &plane);
       break;
     default:
       return -EOPNOTSUPP;
     }
+    if (err)
+      return err;
 
     *val = (type == hwmon_in) ? plane_to_vcc_mv(plane, data)
                               : ((channel == 0) ? plane_core_ma(plane, data)
@@ -729,14 +783,18 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
      * and does not reflect the SMU power governance limit.
      */
     case 0:
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
-                             &plane);
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->svi_core_addr, &plane);
+      if (err)
+        return err;
       *val = safe_power_uw(plane_core_ma(plane, data),
                            plane_to_vcc_mv(plane, data));
       break;
     case 1:
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_soc_addr,
-                             &plane);
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->svi_soc_addr, &plane);
+      if (err)
+        return err;
       *val = safe_power_uw(plane_soc_ma(plane, data),
                            plane_to_vcc_mv(plane, data));
       break;
@@ -751,7 +809,9 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
      * Units: uW.  Converted from SMU register (integer mW or float W).
      */
     case 2:
-      *val = read_smu_power_uw(data, data->smu_ppt_addr);
+      err = read_smu_power_uw(data, data->smu_ppt_addr, val);
+      if (err)
+        return err;
       break;
 
     /*
@@ -765,10 +825,14 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
     case 3: {
       u32 tdc_raw, vcore_plane, tdc_ma, mv;
 
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->smu_tdc_addr,
-                             &tdc_raw);
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
-                             &vcore_plane);
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->smu_tdc_addr, &tdc_raw);
+      if (err)
+        return err;
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->svi_core_addr, &vcore_plane);
+      if (err)
+        return err;
       tdc_ma = ((tdc_raw >> 3) & 0xff) * 1000;
       mv = plane_to_vcc_mv(vcore_plane, data);
       *val = safe_power_uw(tdc_ma, mv);
@@ -784,10 +848,14 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
     case 4: {
       u32 edc_raw, vcore_plane, edc_ma, mv;
 
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->smu_edc_addr,
-                             &edc_raw);
-      data->read_amdsmn_addr(data->pdev, data->node_id, data->svi_core_addr,
-                             &vcore_plane);
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->smu_edc_addr, &edc_raw);
+      if (err)
+        return err;
+      err = data->read_amdsmn_addr(data->pdev, data->node_id,
+                                   data->svi_core_addr, &vcore_plane);
+      if (err)
+        return err;
       edc_ma = ((edc_raw >> 3) & 0xff) * 1000;
       mv = plane_to_vcc_mv(vcore_plane, data);
       *val = safe_power_uw(edc_ma, mv);
@@ -908,6 +976,7 @@ static ssize_t debug_data_show(struct device *dev,
   struct zenpower_data *data = dev_get_drvdata(dev);
   ssize_t len = 0;
   int i;
+  int err;
   u32 raw;
 
 #define DBGPR(fmt, ...)                                                        \
@@ -934,8 +1003,12 @@ static ssize_t debug_data_show(struct device *dev,
   for (i = 0; i < ARRAY_SIZE(debug_addrs); i++) {
     if (len >= PAGE_SIZE - 20)
       break; /* stop before overrun */
-    data->read_amdsmn_addr(data->pdev, data->node_id, debug_addrs[i], &raw);
-    DBGPR("%08x = %08x\n", debug_addrs[i], raw);
+    err = data->read_amdsmn_addr(data->pdev, data->node_id, debug_addrs[i],
+                                 &raw);
+    if (err)
+      DBGPR("%08x = err %d\n", debug_addrs[i], err);
+    else
+      DBGPR("%08x = %08x\n", debug_addrs[i], raw);
   }
 
 #undef DBGPR
@@ -1264,8 +1337,8 @@ static int zenpower_probe(struct pci_dev *pdev,
 
   /* ---- CCD detection -------------------------------------------------- */
   for (i = 0; i < ccd_check; i++) {
-    data->read_amdsmn_addr(pdev, data->node_id, ZEN_CCD_TEMP(i), &val);
-    if ((val & ZEN_CCD_TEMP_VALID_MASK) > 0)
+    if (!data->read_amdsmn_addr(pdev, data->node_id, ZEN_CCD_TEMP(i), &val) &&
+        (val & ZEN_CCD_TEMP_VALID_MASK) > 0)
       data->ccd_visible[i] = true;
   }
 
