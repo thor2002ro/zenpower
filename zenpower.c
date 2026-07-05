@@ -43,7 +43,6 @@
  *   power4  TDC x Vcore      (sustained current proxy, uW, informational)
  *   power5  EDC x Vcore      (peak current proxy, uW, informational)
  *   power6  RAPL package     (MSR energy counter average, uW, when available)
- *   power7  RAPL core        (MSR energy counter average, uW, when available)
  *
  * NOTE: power3-5 use SMU scratch registers whose layout is community-
  * derived.  They hide themselves at probe time if the register returns
@@ -53,12 +52,15 @@
 #include <linux/bitops.h>
 #include <linux/cpu.h>
 #include <linux/hwmon.h>
+#include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/topology.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 #include <asm/msr.h>
 
 /*
@@ -239,15 +241,16 @@ MODULE_PARM_DESC(force_svi3, "Force SVI3 decode path on all chips");
 
 /* AMD RAPL MSRs */
 #define MSR_AMD_RAPL_POWER_UNIT 0xc0010299
-#define MSR_AMD_PP0_ENERGY_STATUS 0xc001029a
 #define MSR_AMD_PKG_ENERGY_STATUS 0xc001029b
 
 #define RAPL_ENERGY_UNIT_MASK 0x1f00
 #define RAPL_ENERGY_UNIT_SHIFT 8
-#define RAPL_ENERGY_STATUS_MASK 0xffffffffULL
+#define RAPL_ENERGY_STATUS_32_MASK 0xffffffffULL
+/* Size the 32-bit accumulator cadence for high-power package limits. */
+#define RAPL_ACCUM_POWER_W 1000
+#define RAPL_ACCUM_MAX_EXP 28
 #define RAPL_CHANNEL_PACKAGE 0
-#define RAPL_CHANNEL_CORE 1
-#define RAPL_CHANNEL_COUNT 2
+#define RAPL_CHANNEL_COUNT 1
 
 /*
  * Plausibility window for SVI voltage auto-detection.
@@ -318,13 +321,20 @@ struct zenpower_data {
    */
   bool smu_float_power;
 
-  /* RAPL power tracking: [0]=package, [1]=core */
+  /* RAPL package power tracking */
+  struct delayed_work rapl_accum_work;
+  struct mutex rapl_lock;
+  u64 rapl_accum_energy[RAPL_CHANNEL_COUNT];
   u64 rapl_prev_energy[RAPL_CHANNEL_COUNT];
+  u64 rapl_prev_raw_energy[RAPL_CHANNEL_COUNT];
   ktime_t rapl_prev_time[RAPL_CHANNEL_COUNT];
   bool rapl_available[RAPL_CHANNEL_COUNT];
   int rapl_cpu;
+  u32 rapl_accum_interval_ms;
   u32 rapl_energy_unit; /* ESU exponent from MSR_AMD_RAPL_POWER_UNIT */
+  bool rapl_counter_64bit;
   bool rapl_initialized;
+  bool rapl_accum_running;
 };
 
 /* ---- Tctl offsets -------------------------------------------------------- */
@@ -355,6 +365,13 @@ static DEFINE_MUTEX(nb_smu_ind_mutex);
  * concurrent readers in read_labels() see a consistent value without a lock.
  */
 static bool multicpu;
+
+static u64 zenpower_mul_u64_u64_div_u64(u64 a, u64 b, u64 d) {
+  if (!d)
+    return ~0ULL;
+
+  return mul_u64_u64_div_u64(a, b, d);
+}
 
 /*
  * amd_pci_dev_to_node_id() was removed from the public kernel API in 6.14
@@ -694,6 +711,109 @@ static int zenpower_rapl_read_msr(struct zenpower_data *data, u32 msr,
   return zenpower_rdmsrq_safe_on_cpu(data->rapl_cpu, msr, val);
 }
 
+static bool zenpower_rapl_counter_is_64bit(void) {
+  /*
+   * Default unknown readable RAPL counters to 32-bit accumulation.  A false
+   * 64-bit assumption turns a 32-bit wrap into a huge power spike; the 32-bit
+   * accumulator is safe for 64-bit counters, just less direct.
+   */
+  if (boot_cpu_data.x86 == 0x19) {
+    switch (boot_cpu_data.x86_model) {
+    case 0x10:
+    case 0x11:
+    case 0x90:
+    case 0xa0:
+      return true;
+    }
+  }
+
+  if (boot_cpu_data.x86 == 0x1a) {
+    switch (boot_cpu_data.x86_model) {
+    case 0x00:
+    case 0x02:
+    case 0x10:
+    case 0x11:
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static u64 zenpower_rapl_normalize_counter(struct zenpower_data *data,
+                                           u64 energy) {
+  return data->rapl_counter_64bit ? energy
+                                  : energy & RAPL_ENERGY_STATUS_32_MASK;
+}
+
+static u64 zenpower_rapl_counter_delta(struct zenpower_data *data,
+                                       u64 energy_now, u64 energy_prev) {
+  if (data->rapl_counter_64bit)
+    return energy_now - energy_prev;
+
+  return (u32)energy_now - (u32)energy_prev;
+}
+
+static u32 zenpower_rapl_accum_interval_ms(u32 energy_unit) {
+  u32 exp = 0;
+  u64 ms;
+
+  if (energy_unit < 31)
+    exp = min_t(u32, RAPL_ACCUM_MAX_EXP, 31 - energy_unit);
+
+  ms = div_u64(1000ULL * BIT_ULL(exp), RAPL_ACCUM_POWER_W);
+  return (u32)max_t(u64, ms, 1);
+}
+
+static int zenpower_rapl_accumulate_channel(struct zenpower_data *data,
+                                            int channel, u64 *energy) {
+  u64 energy_now;
+  int err;
+
+  err = zenpower_rapl_read_msr(data, MSR_AMD_PKG_ENERGY_STATUS, &energy_now);
+  if (err)
+    return err;
+
+  energy_now = zenpower_rapl_normalize_counter(data, energy_now);
+
+  if (data->rapl_counter_64bit) {
+    if (energy)
+      *energy = energy_now;
+    return 0;
+  }
+
+  data->rapl_accum_energy[channel] +=
+      zenpower_rapl_counter_delta(data, energy_now,
+                                  data->rapl_prev_raw_energy[channel]);
+  data->rapl_prev_raw_energy[channel] = energy_now;
+
+  if (energy)
+    *energy = data->rapl_accum_energy[channel];
+
+  return 0;
+}
+
+static void zenpower_rapl_accum_work(struct work_struct *work) {
+  struct zenpower_data *data =
+      container_of(to_delayed_work(work), struct zenpower_data,
+                   rapl_accum_work);
+  int channel;
+
+  if (!READ_ONCE(data->rapl_accum_running))
+    return;
+
+  mutex_lock(&data->rapl_lock);
+  for (channel = 0; channel < RAPL_CHANNEL_COUNT; channel++) {
+    if (data->rapl_available[channel])
+      zenpower_rapl_accumulate_channel(data, channel, NULL);
+  }
+  mutex_unlock(&data->rapl_lock);
+
+  if (READ_ONCE(data->rapl_accum_running))
+    schedule_delayed_work(&data->rapl_accum_work,
+                          msecs_to_jiffies(data->rapl_accum_interval_ms));
+}
+
 static int zenpower_rapl_init(struct zenpower_data *data, struct device *dev) {
   ktime_t now;
   u32 energy_unit;
@@ -710,30 +830,39 @@ static int zenpower_rapl_init(struct zenpower_data *data, struct device *dev) {
 
   energy_unit = (val & RAPL_ENERGY_UNIT_MASK) >> RAPL_ENERGY_UNIT_SHIFT;
   data->rapl_energy_unit = energy_unit;
+  data->rapl_counter_64bit = zenpower_rapl_counter_is_64bit();
+  data->rapl_accum_interval_ms =
+      zenpower_rapl_accum_interval_ms(data->rapl_energy_unit);
 
   err = zenpower_rapl_read_msr(data, MSR_AMD_PKG_ENERGY_STATUS, &val);
   if (err)
     return err;
+  val = zenpower_rapl_normalize_counter(data, val);
+  data->rapl_accum_energy[RAPL_CHANNEL_PACKAGE] = 0;
+  data->rapl_prev_raw_energy[RAPL_CHANNEL_PACKAGE] = val;
   data->rapl_prev_energy[RAPL_CHANNEL_PACKAGE] =
-      val & RAPL_ENERGY_STATUS_MASK;
+      data->rapl_counter_64bit ? val : 0;
   data->rapl_available[RAPL_CHANNEL_PACKAGE] = true;
-
-  err = zenpower_rapl_read_msr(data, MSR_AMD_PP0_ENERGY_STATUS, &val);
-  if (err) {
-    data->rapl_available[RAPL_CHANNEL_CORE] = false;
-    dev_dbg(dev, "RAPL core energy MSR unavailable (%d)\n", err);
-  } else {
-    data->rapl_prev_energy[RAPL_CHANNEL_CORE] =
-        val & RAPL_ENERGY_STATUS_MASK;
-    data->rapl_available[RAPL_CHANNEL_CORE] = true;
-  }
 
   now = ktime_get();
   data->rapl_prev_time[RAPL_CHANNEL_PACKAGE] = now;
-  data->rapl_prev_time[RAPL_CHANNEL_CORE] = now;
   data->rapl_initialized = true;
 
   return 0;
+}
+
+static void zenpower_rapl_start(struct zenpower_data *data) {
+  if (!data->rapl_initialized || data->rapl_counter_64bit)
+    return;
+
+  WRITE_ONCE(data->rapl_accum_running, true);
+  schedule_delayed_work(&data->rapl_accum_work,
+                        msecs_to_jiffies(data->rapl_accum_interval_ms));
+}
+
+static void zenpower_rapl_stop(struct zenpower_data *data) {
+  WRITE_ONCE(data->rapl_accum_running, false);
+  cancel_delayed_work_sync(&data->rapl_accum_work);
 }
 
 static int zenpower_rapl_read_power(struct zenpower_data *data, int channel,
@@ -743,7 +872,6 @@ static int zenpower_rapl_read_power(struct zenpower_data *data, int channel,
   u64 energy_delta;
   u64 divisor;
   u64 uw;
-  u32 msr;
   s64 delta_ms;
   int err;
 
@@ -751,40 +879,41 @@ static int zenpower_rapl_read_power(struct zenpower_data *data, int channel,
       !data->rapl_initialized || !data->rapl_available[channel])
     return -EOPNOTSUPP;
 
-  msr = (channel == RAPL_CHANNEL_PACKAGE) ? MSR_AMD_PKG_ENERGY_STATUS
-                                          : MSR_AMD_PP0_ENERGY_STATUS;
+  mutex_lock(&data->rapl_lock);
 
-  err = zenpower_rapl_read_msr(data, msr, &energy_now);
+  err = zenpower_rapl_accumulate_channel(data, channel, &energy_now);
   if (err)
-    return err;
-  energy_now &= RAPL_ENERGY_STATUS_MASK;
+    goto out_unlock;
 
   now = ktime_get();
   delta = ktime_sub(now, data->rapl_prev_time[channel]);
   delta_ms = ktime_to_ms(delta);
-  if (delta_ms <= 0)
-    return -EAGAIN;
+  if (delta_ms <= 0) {
+    err = -EAGAIN;
+    goto out_unlock;
+  }
 
-  if (energy_now >= data->rapl_prev_energy[channel])
-    energy_delta = energy_now - data->rapl_prev_energy[channel];
-  else
-    energy_delta = (RAPL_ENERGY_STATUS_MASK + 1 -
-                    data->rapl_prev_energy[channel]) +
-                   energy_now;
+  energy_delta = energy_now - data->rapl_prev_energy[channel];
 
-  if ((u64)delta_ms > (~0ULL >> data->rapl_energy_unit))
-    return -ERANGE;
+  if ((u64)delta_ms > (~0ULL >> data->rapl_energy_unit)) {
+    err = -ERANGE;
+    goto out_unlock;
+  }
   divisor = (u64)delta_ms << data->rapl_energy_unit;
-  if (!divisor)
-    return -ERANGE;
+  if (!divisor) {
+    err = -ERANGE;
+    goto out_unlock;
+  }
 
-  uw = div64_u64(energy_delta * 1000000000ULL, divisor);
+  uw = zenpower_mul_u64_u64_div_u64(energy_delta, 1000000000ULL, divisor);
   *val = (long)min_t(u64, uw, (u64)LONG_MAX);
 
   data->rapl_prev_energy[channel] = energy_now;
   data->rapl_prev_time[channel] = now;
 
-  return 0;
+out_unlock:
+  mutex_unlock(&data->rapl_lock);
+  return err;
 }
 
 /* ---- Temperature reading ------------------------------------------------- */
@@ -870,8 +999,8 @@ static umode_t zenpower_is_visible(const void *rdata,
       return 0;
     if (channel == 5 && !data->rapl_available[RAPL_CHANNEL_PACKAGE])
       return 0;
-    if (channel == 6 && !data->rapl_available[RAPL_CHANNEL_CORE])
-      return 0;
+    if (channel == 5 && attr == hwmon_power_input)
+      return 0440;
     break;
 
   default:
@@ -1064,7 +1193,7 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
     }
 
     /*
-     * ch5 / ch6: RAPL package/core power in uW.
+     * ch5: RAPL package power in uW.
      *
      * RAPL reports monotonically increasing energy counters; power is the
      * average rate between this read and the previous read for the channel.
@@ -1073,11 +1202,6 @@ static int zenpower_read(struct device *dev, enum hwmon_sensor_types type,
      */
     case 5:
       err = zenpower_rapl_read_power(data, RAPL_CHANNEL_PACKAGE, val);
-      if (err)
-        return err;
-      break;
-    case 6:
-      err = zenpower_rapl_read_power(data, RAPL_CHANNEL_CORE, val);
       if (err)
         return err;
       break;
@@ -1125,9 +1249,8 @@ static const char *const zenpower_curr_label[][2] = {
  *   [3] TDC x Vcore proxy    (ch3)
  *   [4] EDC x Vcore proxy    (ch4)
  *   [5] RAPL package power   (ch5)
- *   [6] RAPL core power      (ch6)
  */
-static const char *const zenpower_power_label[][7] = {
+static const char *const zenpower_power_label[][6] = {
     {
         "SVI_P_Core",
         "SVI_P_SoC",
@@ -1135,7 +1258,6 @@ static const char *const zenpower_power_label[][7] = {
         "TDC_Core_proxy",
         "EDC_Core_proxy",
         "RAPL_P_Package",
-        "RAPL_P_Core",
     },
     {
         "cpu0 SVI_P_Core",
@@ -1144,7 +1266,6 @@ static const char *const zenpower_power_label[][7] = {
         "cpu0 TDC_Core_proxy",
         "cpu0 EDC_Core_proxy",
         "cpu0 RAPL_P_Package",
-        "cpu0 RAPL_P_Core",
     },
     {
         "cpu1 SVI_P_Core",
@@ -1153,7 +1274,6 @@ static const char *const zenpower_power_label[][7] = {
         "cpu1 TDC_Core_proxy",
         "cpu1 EDC_Core_proxy",
         "cpu1 RAPL_P_Package",
-        "cpu1 RAPL_P_Core",
     },
 };
 
@@ -1223,8 +1343,9 @@ static ssize_t debug_data_show(struct device *dev,
   DBGPR("RAPL_INIT:  %d\n", data->rapl_initialized);
   DBGPR("RAPL_CPU:   %d\n", data->rapl_cpu);
   DBGPR("RAPL_PKG:   %d\n", data->rapl_available[RAPL_CHANNEL_PACKAGE]);
-  DBGPR("RAPL_CORE:  %d\n", data->rapl_available[RAPL_CHANNEL_CORE]);
   DBGPR("RAPL_ESU:   %u\n", data->rapl_energy_unit);
+  DBGPR("RAPL_BITS:  %u\n", data->rapl_counter_64bit ? 64 : 32);
+  DBGPR("RAPL_POLL:  %u\n", data->rapl_accum_interval_ms);
   DBGPR("FLOAT_PWR:  %d\n", data->smu_float_power);
   DBGPR("SVI_CORE:   %08x\n", data->svi_core_addr);
   DBGPR("SVI_SOC:    %08x\n", data->svi_soc_addr);
@@ -1276,8 +1397,7 @@ static const struct hwmon_channel_info *zenpower_info[] = {
                        HWMON_P_INPUT | HWMON_P_LABEL,  /* PPT package      */
                        HWMON_P_INPUT | HWMON_P_LABEL,  /* TDC proxy        */
                        HWMON_P_INPUT | HWMON_P_LABEL,  /* EDC proxy        */
-                       HWMON_P_INPUT | HWMON_P_LABEL,  /* RAPL package     */
-                       HWMON_P_INPUT | HWMON_P_LABEL), /* RAPL core        */
+                       HWMON_P_INPUT | HWMON_P_LABEL), /* RAPL package     */
 
     NULL};
 
@@ -1319,6 +1439,7 @@ static int zenpower_probe(struct pci_dev *pdev,
     return -ENOMEM;
 
   data->pdev = pdev;
+  pci_set_drvdata(pdev, data);
   data->zen_gen = ZEN_GEN_1;
   data->svi_ver = SVI_VER_2;
   data->read_amdsmn_addr = nb_index_read;
@@ -1329,8 +1450,13 @@ static int zenpower_probe(struct pci_dev *pdev,
   data->edc_visible = false;
   data->smu_float_power = false;
   data->rapl_initialized = false;
+  data->rapl_accum_running = false;
+  data->rapl_counter_64bit = false;
   data->rapl_cpu = -1;
+  data->rapl_accum_interval_ms = 0;
   data->rapl_energy_unit = 0;
+  mutex_init(&data->rapl_lock);
+  INIT_DELAYED_WORK(&data->rapl_accum_work, zenpower_rapl_accum_work);
   data->temp_offset = 0;
   data->node_id = 0;
   for (i = 0; i < MAX_CCD; i++)
@@ -1622,8 +1748,19 @@ static int zenpower_probe(struct pci_dev *pdev,
   /* ---- Register with hwmon -------------------------------------------- */
   hwmon_dev = devm_hwmon_device_register_with_info(
       dev, "zenpower", data, &zenpower_chip_info, zenpower_groups);
+  if (IS_ERR(hwmon_dev))
+    return PTR_ERR(hwmon_dev);
 
-  return PTR_ERR_OR_ZERO(hwmon_dev);
+  zenpower_rapl_start(data);
+
+  return 0;
+}
+
+static void zenpower_remove(struct pci_dev *pdev) {
+  struct zenpower_data *data = pci_get_drvdata(pdev);
+
+  if (data)
+    zenpower_rapl_stop(data);
 }
 
 /* ---- PCI ID table -------------------------------------------------------- */
@@ -1665,6 +1802,7 @@ static struct pci_driver zenpower_driver = {
     .name = "zenpower",
     .id_table = zenpower_id_table,
     .probe = zenpower_probe,
+    .remove = zenpower_remove,
 };
 
 module_pci_driver(zenpower_driver);
