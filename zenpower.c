@@ -63,6 +63,11 @@
 #include <linux/workqueue.h>
 #include <asm/msr.h>
 
+/* Linux 7.2 stopped including the CPUID API via asm/processor.h. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+#include <asm/cpuid/api.h>
+#endif
+
 /*
  * Linux 6.16 reorganised the AMD northbridge header from asm/amd_nb.h into
  * asm/amd/nb.h.  Guard both paths so the driver builds on kernels before and
