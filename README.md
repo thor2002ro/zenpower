@@ -29,6 +29,10 @@ with `dkms status`, then follow the module activation steps below.
 To build without installing, run `makepkg -s`. To remove the package and its
 DKMS modules, run `sudo pacman -R zenpower-dkms`.
 
+The package installs `/usr/lib/modprobe.d/zenpower.conf` to blacklist k10temp
+from automatic loading. Removing the package removes this blacklist. If
+k10temp is already loaded, unload it before activating zenpower as shown below.
+
 If you edit a packaged source file, refresh the `PKGBUILD` checksums with
 `updpkgsums` (from `pacman-contrib`) and rebuild with `makepkg -fsi`. Keep
 `pkgver` in sync with `VERSION` in the Makefile when changing the module version.
@@ -47,10 +51,12 @@ Because zenpower is using same PCI device as k10temp, you have to disable k10tem
 
 1. Check if k10temp is active. `lsmod | grep k10temp`
 2. Unload k10temp `sudo modprobe -r k10temp`
-3. (optional*) blacklist k10temp: `sudo bash -c 'sudo echo -e "\n# replaced with zenpower\nblacklist k10temp" >> /etc/modprobe.d/blacklist.conf'`
+3. For manual installations, optionally copy the blacklist file:
+   `sudo install -Dm644 zenpower.conf /etc/modprobe.d/zenpower.conf`.
+   The Arch package already installs it.
 4. Activate zenpower `sudo modprobe zenpower`
 
-*If k10temp is not blacklisted, you may have to manually unload k10temp after each restart.
+If k10temp is not blacklisted, you may have to manually unload k10temp after each restart.
 
 ## Sensors monitoring
 You can use this app: [zenmonitor](https://github.com/ocerman/zenmonitor), or your favourie sensors monitoring software
