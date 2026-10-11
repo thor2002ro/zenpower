@@ -1039,8 +1039,6 @@ static umode_t zenpower_is_visible(const void *rdata,
       return 0;
     if (channel == 5 && !data->rapl_available[RAPL_CHANNEL_PACKAGE])
       return 0;
-    if (channel == 5 && attr == hwmon_power_input)
-      return 0440;
     break;
 
   default:
@@ -1737,6 +1735,18 @@ static int zenpower_probe(struct pci_dev *pdev,
   }
 
   /* ---- SVI protocol auto-detect --------------------------------------- */
+  /* Hide unavailable rails; a nonzero VID with zero current remains valid.
+   * Keep configured addresses on read errors, which may be transient.
+   */
+  if (data->svi_core_addr &&
+      !data->read_amdsmn_addr(pdev, data->node_id, data->svi_core_addr, &val) &&
+      (val == 0 || val == 0xffffffff))
+    data->svi_core_addr = 0;
+  if (data->svi_soc_addr &&
+      !data->read_amdsmn_addr(pdev, data->node_id, data->svi_soc_addr, &val) &&
+      (val == 0 || val == 0xffffffff))
+    data->svi_soc_addr = 0;
+
   data->svi_ver = detect_svi_version(data, presumed_svi);
 
   /* ---- CCD detection -------------------------------------------------- */
