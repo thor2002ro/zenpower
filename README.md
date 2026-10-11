@@ -7,6 +7,32 @@ For AMD family 17h Model 70h (Ryzen 3000) CPUs you need kernel version 5.3.4 or 
 ## Installation
 You can install this module via dkms.
 
+### Arch Linux / Manjaro package
+
+The local `PKGBUILD` packages this checkout as `zenpower-dkms`, including its
+sources and DKMS configuration in `/usr/src/zenpower-0.6.0`. Install `base-devel`
+and the headers matching each kernel you want to use (for example,
+`linux-headers` on Arch's standard kernel, `linux-lts-headers` for Arch LTS, or
+the matching Manjaro kernel headers).
+
+Run from this repository as your normal user:
+
+```sh
+makepkg -si
+```
+
+This builds a pacman package, installs the `dkms` dependency if needed, and
+installs the package. Arch's DKMS hooks build and install the module for kernels
+with headers installed, and rebuild it after kernel updates. Check the result
+with `dkms status`, then follow the module activation steps below.
+
+To build without installing, run `makepkg -s`. To remove the package and its
+DKMS modules, run `sudo pacman -R zenpower-dkms`.
+
+If you edit a packaged source file, refresh the `PKGBUILD` checksums with
+`updpkgsums` (from `pacman-contrib`) and rebuild with `makepkg -fsi`. Keep
+`pkgver` in sync with `VERSION` in the Makefile when changing the module version.
+
 ### Installation commands for Ubuntu
 ```
 sudo apt install dkms git build-essential linux-headers-$(uname -r)
